@@ -1,0 +1,59 @@
+{
+  "name": "2am-studio-parceiros",
+  "productName": "2AM Studio Parceiros",
+  "version": "1.4.32",
+  "author": "2AM Studio",
+  "description": "Plataforma e Agente do Parceiro 2AM Studio",
+  "private": true,
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "build": "vite build && tsc -p tsconfig.electron.json",
+    "build:electron": "vite build && tsc -p tsconfig.electron.json",
+    "dist": "vite build && tsc -p tsconfig.electron.json && electron-builder"
+  },
+  "build": {
+    "appId": "com.twomstudio.parceiros",
+    "productName": "2AM Studio Parceiros",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "public/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "2AM Studio Parceiros",
+      "perMachine": false,
+      "deleteAppDataOnUninstall": false,
+      "differentialPackage": false
+    }
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.114.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "electron-updater": "^6.8.9",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "ws": "^8.21.3"
+  }
+}

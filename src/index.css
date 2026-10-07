@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --vintage-espresso: #141210;
+    --vintage-panel: #1C1815;
+    --vintage-card: #221D19;
+    --vintage-border: #3A322A;
+    --vintage-border-light: #4E4338;
+    --vintage-parchment: #F5EFE6;
+    --vintage-sand: #D5C9B8;
+    --vintage-sepia: #9E9182;
+    --vintage-brass: #C59B27;
+    --vintage-brass-light: #DFC068;
+    --vintage-brass-dark: #8C6D19;
+  }
+
+  body {
+    background-color: #141210;
+    color: #EDE4D5;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Custom scrollbar vintage em latão envelhecido */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #171412;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #383028;
+    border-radius: 4px;
+    border: 1px solid #28221D;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #5A4C3D;
+  }
+}
