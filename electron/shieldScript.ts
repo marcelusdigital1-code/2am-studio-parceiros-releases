@@ -818,6 +818,7 @@ export interface ShieldOptions {
   gender?: string;
   lastCode?: string;
   pageUrl?: string;
+  isPublishing?: boolean;
 }
 
 export function buildChromeSecurityScript(options: ShieldOptions = {}): string {
@@ -830,6 +831,7 @@ export function buildChromeSecurityScript(options: ShieldOptions = {}): string {
     const gender = options.gender || 'male';
     const lastCode = options.lastCode || '';
     const pageUrl = options.pageUrl || '';
+    const isPublishing = Boolean(options.isPublishing);
     return `
     var POST_LOGIN_CSS = ${JSON.stringify(POST_LOGIN_CSS)};
     var SHADOW_CSS = ${JSON.stringify(SHADOW_CSS)};
@@ -845,10 +847,11 @@ export function buildChromeSecurityScript(options: ShieldOptions = {}): string {
       window.__AGENT_GENDER__ = ${JSON.stringify(gender)};
       window.__AGENT_LAST_CODE__ = ${JSON.stringify(lastCode)};
       window.__AGENT_PAGE_URL__ = ${JSON.stringify(pageUrl)};
+      window.__AGENT_AUTO_PUBLISHING__ = ${JSON.stringify(isPublishing)};
 
       // 0. Injeção condicional de POST_LOGIN_CSS no documento (apenas se já autenticado)
       try {
-        if (!window.__AGENT_IS_SIGNUP__ && typeof checkIsConnected === 'function' && checkIsConnected()) {
+        if (!window.__AGENT_IS_SIGNUP__ && !window.__AGENT_AUTO_PUBLISHING__ && typeof checkIsConnected === 'function' && checkIsConnected()) {
           var existingStyle = document.getElementById('agent-post-login-css');
           if (!existingStyle) {
             var s = document.createElement('style');
@@ -1206,6 +1209,8 @@ export function buildChromeSecurityScript(options: ShieldOptions = {}): string {
 
       function sanitizeFacebook() {
         if (!window.location.hostname.includes('facebook.com')) return;
+        // Bypass completo durante publicação automática para permitir alternância de Página
+        if (window.__AGENT_AUTO_PUBLISHING__) return;
         try {
           var banner = document.querySelector('div[role="banner"]');
           if (banner) {
@@ -1884,7 +1889,7 @@ export function buildChromeSecurityScript(options: ShieldOptions = {}): string {
                           // Permitir a Página Atribuída fornecida pelo ADM
                           var assignedPage = (window.__AGENT_PAGE_URL__ || '').toLowerCase().trim();
                           if (assignedPage) {
-                            var cleanAssigned = assignedPage.replace('https://www.facebook.com', '').replace('https://facebook.com', '');
+                            var cleanAssigned = assignedPage.replace('https://www.facebook.com', '').replace('https://web.facebook.com', '').replace('https://facebook.com', '');
                             if (url.startsWith(assignedPage) || (cleanAssigned.length > 2 && url.includes(cleanAssigned))) {
                               return false;
                             }
@@ -1905,14 +1910,8 @@ export function buildChromeSecurityScript(options: ShieldOptions = {}): string {
                           );
                           if (isFbAllowed) return false;
 
-                          if (url === 'https://www.facebook.com' || url === 'https://www.facebook.com/' || url.startsWith('https://www.facebook.com/?') || url.includes('/home.php') || url.includes('/me') || url.includes('/notifications') || url.includes('/messages')) {
-                            return true;
-                          }
-
-                          // Se houver página atribuída, qualquer navegação para outra página pessoal/externa é bloqueada
-                          if (assignedPage) {
-                            return true;
-                          }
+                          // Permitir navegação legítima em páginas sem loop de redirecionamento
+                          return false;
                         }
 
                         return false;
@@ -1932,8 +1931,8 @@ export function buildChromeSecurityScript(options: ShieldOptions = {}): string {
                           var isFbConn = false;
                           try { isFbConn = checkIsConnected(); } catch(e) {}
                           targetSafe = isFbConn
-                            ? (window.__AGENT_PAGE_URL__ || 'https://www.facebook.com/pages/')
-                            : 'https://www.facebook.com/login';
+                            ? (window.__AGENT_PAGE_URL__ || 'https://web.facebook.com/pages/')
+                            : (window.__AGENT_PAGE_URL__ || 'https://web.facebook.com/pages/');
                         } else if (currentUrl.includes('tiktok.com') && !currentUrl.includes('studio')) {
                           targetSafe = SAFE_URL_WEB;
                         }
@@ -1982,6 +1981,13 @@ export function buildChromeSecurityScript(options: ShieldOptions = {}): string {
                       function applyPostLoginSecurity() {
                         // Se o usuário ainda não estiver conectado/autenticado, NUNCA aplicar regras pós-login
                         if (typeof checkIsConnected === 'function' && !checkIsConnected()) {
+                          return;
+                        }
+
+                        // Durante publicação automática, remover CSS de bloqueio para permitir alternância de Página
+                        if (window.__AGENT_AUTO_PUBLISHING__) {
+                          var existingCss = document.getElementById('agent-post-login-css');
+                          if (existingCss) existingCss.remove();
                           return;
                         }
 
@@ -2407,6 +2413,9 @@ export function buildChromeSecurityScript(options: ShieldOptions = {}): string {
                               }
                             }
                             if (isUpload) return; // Permitido!
+
+                            // Durante publicação automática no Facebook, permitir todos os cliques (alternância de Página)
+                            if (window.__AGENT_AUTO_PUBLISHING__ && window.location.hostname.includes('facebook.com')) return;
 
                             // 1. Inspecionar cada nó no caminho do evento (penetra Shadow DOM do YouTube e componentes do Facebook)
                             for (var pIdx = 0; pIdx < path.length; pIdx++) {

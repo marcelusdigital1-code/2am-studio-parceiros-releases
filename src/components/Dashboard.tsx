@@ -7,6 +7,23 @@ interface Props {
   onNavigate: (tab: 'dashboard' | 'accounts' | 'videos' | 'metrics' | 'payments') => void;
 }
 
+const isEmailLike = (str?: string | null): boolean => {
+  if (!str) return false;
+  return str.includes('@') && (str.includes('.com') || str.includes('.net') || str.includes('.org') || str.includes('.io') || str.includes('.br') || str.includes('.pt') || /\S+@\S+\.\S+/.test(str));
+};
+
+const formatAccountDisplayName = (username?: string, platform?: string) => {
+  if (!username || isEmailLike(username)) {
+    switch (platform) {
+      case 'youtube': return 'Canal YouTube';
+      case 'facebook': return 'Página Facebook';
+      case 'instagram': return 'Conta Creator';
+      default: return 'Canal TikTok';
+    }
+  }
+  return username.startsWith('@') ? username : `@${username}`;
+};
+
 export const Dashboard: React.FC<Props> = ({ partnerId, onNavigate }) => {
   const [profilesCount, setProfilesCount] = useState(0);
   const [accountsCount, setAccountsCount] = useState(0);
@@ -144,7 +161,7 @@ export const Dashboard: React.FC<Props> = ({ partnerId, onNavigate }) => {
                 <div className="flex items-center gap-3">
                   <PlatformIcon platform={acc.platform} className="w-6 h-6 shrink-0 rounded-md" />
                   <div>
-                    <h4 className="font-bold text-xs text-white">{acc.username}</h4>
+                    <h4 className="font-bold text-xs text-white">{formatAccountDisplayName(acc.username, acc.platform)}</h4>
                     <p className="text-[10px] text-slate-400 capitalize">{acc.platform}</p>
                   </div>
                 </div>
@@ -195,7 +212,7 @@ export const Dashboard: React.FC<Props> = ({ partnerId, onNavigate }) => {
                       {job.videos?.filename || 'Vídeo sem nome'}
                     </p>
                     <p className="text-[11px] text-slate-400">
-                      Destino: <span className="font-semibold text-blue-400">{job.accounts?.username || 'Conta'}</span>
+                      Destino: <span className="font-semibold text-blue-400">{formatAccountDisplayName(job.accounts?.username, job.accounts?.platform)}</span>
                     </p>
                   </div>
                 </div>

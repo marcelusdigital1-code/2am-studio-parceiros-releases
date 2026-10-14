@@ -14,8 +14,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('pre-login-google', data),
 
   // 2FA request relay: Chrome Real → Electron → React
-  onChromeRequest2FA: (cb: (data: { profileId: string }) => void) =>
-    ipcRenderer.on('chrome-request-2fa', (_e: Electron.IpcRendererEvent, data: { profileId: string }) => cb(data)),
+  onChromeRequest2FA: (cb: (data: { profileId: string; partnerId?: string; platform?: string; isRetry?: boolean; errorMessage?: string }) => void) =>
+    ipcRenderer.on('chrome-request-2fa', (_e: Electron.IpcRendererEvent, data: any) => cb(data)),
+
 
   // Auth/connection status: Chrome Real → Electron → React
   onChromeAuthStatus: (cb: (data: { profileId: string; isLoggedIn: boolean }) => void) =>

@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { supabase, type Account } from '../lib/supabase';
 import { ProfileCard, type GroupedProfile, type AccountWithMetrics, type QueueAccountStatus } from './ProfileCard';
+import { sanitizeCode } from '../lib/sanitize';
 
 interface Props {
   partnerId: string;
@@ -333,38 +334,130 @@ export const AccountsView: React.FC<Props> = ({ partnerId }) => {
       } catch {}
     };
 
-    // Throttle: no máximo 1 notificação 2FA a cada 90 segundos por profileId
+    // Throttle: no máximo 1 notificação 2FA a cada 90 segundos por profileId (exceto se for re-tentativa após código incorreto)
     const _fa2LastSent: Record<string, number> = {};
-    window.electronAPI.onChromeRequest2FA(async ({ profileId }) => {
+    window.electronAPI.onChromeRequest2FA(async ({ profileId, partnerId: evtPartnerId, platform, isRetry, errorMessage, accountId, codeType, email: evtEmail }) => {
       const _now = Date.now();
-      if (_fa2LastSent[profileId] && _now - _fa2LastSent[profileId] < 90000) {
+      if (!isRetry && _fa2LastSent[profileId] && _now - _fa2LastSent[profileId] < 90000) {
         console.log('[2FA-THROTTLE] Notificação ignorada (cooldown 90s) para', profileId);
         return;
       }
       _fa2LastSent[profileId] = _now;
-      let acc = accountsRef.current.find((a) => a.account_code === profileId);
-      if (!acc) {
-        acc = accountsRef.current.find((a) => a.platform === 'facebook');
+
+      // Localização precisa da conta alvo: NUNCA fazer fallback cego para a primeira conta da lista
+      let acc: AccountWithMetrics | undefined;
+      if (accountId) {
+        acc = accountsRef.current.find((a) => a.id === accountId);
       }
-      if (!acc && accountsRef.current.length > 0) {
-        acc = accountsRef.current[0];
+      if (!acc && profileId) {
+        acc = accountsRef.current.find((a) => a.account_code === profileId || a.id === profileId);
+      }
+      if (!acc && evtEmail) {
+        const cleanEvtEmail = evtEmail.trim().toLowerCase();
+        acc = accountsRef.current.find(
+          (a) =>
+            a.controlled_emails?.email?.trim().toLowerCase() === cleanEvtEmail ||
+            a.google_email?.trim().toLowerCase() === cleanEvtEmail ||
+            a.username?.trim().toLowerCase() === cleanEvtEmail
+        );
+      }
+      if (!acc && platform) {
+        acc = accountsRef.current.find((a) => a.platform === platform);
       }
 
-      const email = acc?.controlled_emails?.email || acc?.username || 'Facebook';
-      const username = acc?.username || 'Facebook';
-      const accountCode = acc?.account_code || profileId || 'FB';
-      const reqCode = 'REQ-' + Math.floor(1000 + Math.random() * 9000);
+      const effPlatform = (platform || acc?.platform || '').toLowerCase();
+      const platformName = effPlatform === 'tiktok' ? 'TikTok'
+        : (effPlatform === 'youtube' || effPlatform === 'google') ? 'YouTube / Google'
+        : effPlatform === 'facebook' ? 'Facebook'
+        : effPlatform === 'instagram' ? 'Instagram'
+        : 'Plataforma';
+
+      let reqType = 'totp';
+      let codeInstructions = '';
+
+      if (effPlatform === 'tiktok') {
+        if (codeType === 'google_totp') {
+          reqType = 'totp';
+          codeInstructions = 'Login TikTok via Google: Código 2FA da Google (Google Authenticator, SMS ou aviso no telemóvel da conta Google vinculada)';
+        } else {
+          reqType = 'email_verification';
+          codeInstructions = 'TikTok: Código de 6 dígitos enviado por E-mail (Verifique a caixa de entrada do e-mail da conta TikTok: "Verifica que és mesmo tu")';
+        }
+      } else if (effPlatform === 'youtube' || effPlatform === 'google') {
+        reqType = 'totp';
+        codeInstructions = 'YouTube / Google: Código de Segurança 2FA (Google Authenticator, SMS ou aviso no telemóvel)';
+      } else if (effPlatform === 'facebook') {
+        reqType = 'totp';
+        codeInstructions = 'Facebook: Código de Autenticação 2FA (Authenticator, SMS ou E-mail)';
+      } else if (effPlatform === 'instagram') {
+        reqType = 'totp';
+        codeInstructions = 'Instagram: Código de Autenticação 2FA (Authenticator, SMS ou WhatsApp)';
+      } else {
+        reqType = 'totp';
+        codeInstructions = 'Código de Segurança / Verificação 2FA';
+      }
+
+      const rawUser = acc?.username || '';
+      const isUserEmail = rawUser.includes('@') && rawUser.includes('.');
+      const username = isUserEmail ? platformName : (rawUser || platformName);
+      const email = evtEmail || acc?.controlled_emails?.email || (isUserEmail ? rawUser : '') || acc?.google_email || null;
+      const accountCode = acc?.account_code || profileId || 'CONTA';
+      const reqCode = isRetry
+        ? 'RETRY-' + Math.floor(1000 + Math.random() * 9000)
+        : 'REQ-' + Math.floor(1000 + Math.random() * 9000);
+
+      // 🛑 Requisito Crítico: Cancelar imediatamente o watchdog timeout de 4 minutos!
+      // Enquanto aguarda o código 2FA do ADM, a fila NUNCA deve pular para a próxima conta nem fechar o Chrome por timeout.
+      if (watchdogTimersRef.current.has(accountCode)) {
+        console.log('[AUTO-LOGIN] 🛑 Cancelando watchdog timeout de 4 min para', accountCode, '(espera sem limite por código 2FA do ADM)');
+        clearTimeout(watchdogTimersRef.current.get(accountCode)!);
+        watchdogTimersRef.current.delete(accountCode);
+      }
+      if (watchdogTimersRef.current.has(profileId)) {
+        clearTimeout(watchdogTimersRef.current.get(profileId)!);
+        watchdogTimersRef.current.delete(profileId);
+      }
+
+      // Atualizar status na fila de auto-login informando espera infinita
+      setQueueMap((prev) => ({
+        ...prev,
+        [accountCode]: {
+          status: 'running',
+          message: isRetry
+            ? `🚨 Código incorreto! Aguardando novo 2FA (${platformName}) do ADM (sem tempo limite)...`
+            : `🔑 Aguardando código (${platformName}) do ADM (sem tempo limite)...`,
+        },
+      }));
 
       playChime();
 
       setToast({
         id: reqCode,
-        type: 'pending',
-        title: '🔑 Pedido 2FA Enviado ao ADM',
-        message: `Solicitação ${reqCode} para ${username} (${accountCode}) enviada. Aguardando ADM...`,
+        type: isRetry ? 'error' : 'pending',
+        title: isRetry ? `🚨 Código ${platformName} Incorreto / Expirado!` : `🔑 Pedido 2FA (${platformName}) Enviado ao ADM`,
+        message: isRetry
+          ? `O código fornecido para ${platformName} (${accountCode}) foi rejeitado pelo serviço (${errorMessage || 'código incorreto'}). Pedido de novo código (${reqCode}) reenviado com urgência ao Administrador!`
+          : `Solicitação ${reqCode} para ${platformName} (${accountCode}) enviada ao Administrador. Aguardando validação (sem tempo limite)...`,
       });
 
       try {
+        // Expirar pedidos antigos pendentes desta mesma conta/parceiro para não poluir nem deixar duplicatas pendentes
+        try {
+          if (acc?.id) {
+            await supabase
+              .from('code_requests')
+              .update({ status: 'expired' })
+              .eq('account_id', acc.id)
+              .eq('status', 'pending');
+          } else if (partnerId) {
+            await supabase
+              .from('code_requests')
+              .update({ status: 'expired' })
+              .eq('partner_id', partnerId)
+              .eq('status', 'pending');
+          }
+        } catch {}
+
         await supabase.from('code_requests').insert({
           request_code: reqCode,
           partner_id: partnerId,
@@ -372,7 +465,7 @@ export const AccountsView: React.FC<Props> = ({ partnerId }) => {
           email: email,
           password_encrypted: null,
           birth_date: acc?.birth_date || null,
-          request_type: 'totp',
+          request_type: reqType,
           status: 'pending',
         });
 
@@ -380,8 +473,10 @@ export const AccountsView: React.FC<Props> = ({ partnerId }) => {
           await supabase.from('notifications').insert({
             target_type: 'admin',
             target_id: partnerId || '00000000-0000-0000-0000-000000000000',
-            title: '🔑 Pedido de Código 2FA Recebido',
-            message: `O parceiro solicitou código 2FA para o perfil ${username} (${accountCode}). Pedido: ${reqCode}`,
+            title: isRetry ? `🚨 [${platformName}] CÓDIGO 2FA INCORRETO / EXPIRADO!` : `🔑 [${platformName}] Pedido de Código de Verificação`,
+            message: isRetry
+              ? `ATENÇÃO: O código enviado pelo ADM para ${platformName} (${username} - ${accountCode}) foi rejeitado pelo serviço (${errorMessage || 'código incorreto/expirado'}). Envie um novo código com urgência! Instrução: ${codeInstructions}. Pedido: ${reqCode}`
+              : `O parceiro precisa de código para ${platformName} (${username} - ${accountCode}). Instrução: ${codeInstructions}. Pedido: ${reqCode}`,
             type: 'code_request',
             is_read: false,
           });
@@ -415,11 +510,28 @@ export const AccountsView: React.FC<Props> = ({ partnerId }) => {
             .eq('request_code', reqCode)
             .single();
 
-          const codeReceived = reqData?.code_value || reqData?.totp_code;
-          if (reqData?.status === 'responded' && codeReceived) {
+          let codeReceived = reqData?.code_value || reqData?.totp_code;
+
+          // Fallback resiliente: se o pedido específico ainda não tiver valor mas a conta tiver sido atendida
+          if (!codeReceived && acc?.id) {
+            const { data: altReq } = await supabase
+              .from('code_requests')
+              .select('status, totp_code, code_value')
+              .eq('account_id', acc.id)
+              .eq('status', 'responded')
+              .order('responded_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+            if (altReq?.status === 'responded') {
+              codeReceived = altReq.code_value || altReq.totp_code;
+            }
+          }
+
+          if (codeReceived) {
             onSuccess(codeReceived);
           }
-        }, 2500);
+        }, 2000);
 
         const onSuccess = (codeVal: string) => {
           if (cleanedUp) return;
@@ -427,28 +539,26 @@ export const AccountsView: React.FC<Props> = ({ partnerId }) => {
           clearInterval(pollTimer);
           supabase.removeChannel(channel);
 
-          if (codeVal !== 'MOBILE_APPROVED' && window.electronAPI) {
+          const cleanCode = sanitizeCode(codeVal);
+
+          if (cleanCode !== 'MOBILE_APPROVED' && window.electronAPI) {
             window.electronAPI.chromeInjectCode({
-              code: codeVal,
+              code: cleanCode,
               profileId: accountCode,
             });
           }
 
-          playChime();
-          const isMobileApprove = codeVal === 'MOBILE_APPROVED';
-          setToast({
-            id: reqCode,
-            type: 'success',
-            title: isMobileApprove ? '📱 Aprovação Concluída pelo ADM!' : '✨ Código 2FA Recebido e Injetado!',
-            message: isMobileApprove
-              ? `O ADM confirmou a aprovação no celular para ${username}. O login prosseguirá.`
-              : `Código: ${codeVal} enviado para o navegador real de ${username}`,
-            code: isMobileApprove ? undefined : codeVal,
-          });
+          // Injetar silenciosamente em segundo plano: atualizar fila e dispensar toast do pedido sem popup flutuante
+          setQueueMap((prev) => ({
+            ...prev,
+            [accountCode]: {
+              status: 'running',
+              message: '⚡ Código recebido e injetado! Concluindo autenticação...',
+            },
+          }));
 
-          setTimeout(() => {
-            setToast((prev) => (prev?.id === reqCode ? null : prev));
-          }, 15000);
+          // Dispensar discretamente o toast de pedido pendente sem criar popup com o código
+          setToast((prev) => (prev?.id === reqCode ? null : prev));
         };
       } catch (e) {
         console.error('Erro ao processar pedido 2FA:', e);
@@ -530,7 +640,7 @@ export const AccountsView: React.FC<Props> = ({ partnerId }) => {
       case 'youtube':
         return 'https://studio.youtube.com/';
       case 'facebook':
-        return 'https://web.facebook.com/login';
+        return 'https://web.facebook.com/pages/';
       case 'instagram':
         return 'https://www.instagram.com/accounts/login/';
       default:
@@ -1003,6 +1113,9 @@ export const AccountsView: React.FC<Props> = ({ partnerId }) => {
     skipped: queueValues.filter((q) => q.status === 'skipped').length,
   };
 
+  const activeAccounts = accounts.filter((a) => a.status === 'active');
+  const allAlreadyAuth = activeAccounts.length > 0 && activeAccounts.every((a) => authStatusMap[a.account_code] === true);
+
   return (
     <div className="p-6 space-y-6 relative">
       {/* Header */}
@@ -1049,32 +1162,44 @@ export const AccountsView: React.FC<Props> = ({ partnerId }) => {
             </div>
           )}
 
-          {/* Botão de Auto-Login em 2º Plano */}
-          <button
-            onClick={isAutoLoginRunning ? handleStopAutoLogin : handleAutoLoginAll}
-            className={`text-xs px-3.5 py-1.5 rounded-xl font-bold transition-all flex items-center gap-2 shadow-xs cursor-pointer ${
-              isAutoLoginRunning
-                ? 'bg-[#2A1818] hover:bg-[#3D2020] text-[#F87171] border border-[#522525]'
-                : 'bg-gradient-to-r from-[#8C6D19] via-[#B8860B] to-[#C59B27] hover:brightness-110 text-[#141210] border border-[#DFC068]/40'
-            }`}
-            title={
-              isAutoLoginRunning
-                ? 'Interromper o processo de login automático em segundo plano'
-                : 'Iniciar login automático em segundo plano para todas as contas ativas com skip em caso de erro'
-            }
-          >
-            {isAutoLoginRunning ? (
-              <>
-                <span className="w-2 h-2 rounded-full bg-[#F87171] animate-ping" />
-                <span>⏹️ Parar Auto-Login</span>
-              </>
-            ) : (
-              <>
-                <span>🚀</span>
-                <span>Iniciar Auto-Login (2º Plano)</span>
-              </>
-            )}
-          </button>
+          {/* Botão de Auto-Login em 2º Plano / Parar */}
+          {isAutoLoginRunning ? (
+            <button
+              onClick={handleStopAutoLogin}
+              className="text-xs px-3.5 py-1.5 rounded-xl font-bold transition-all flex items-center gap-2 shadow-xs select-none bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-500/50 cursor-pointer animate-pulse"
+              title="Clique para interromper o auto-login e fechar os navegadores em andamento"
+            >
+              <span className="w-2 h-2 rounded-full bg-red-400 animate-ping" />
+              <span>⏹️ Parar Auto-Login</span>
+            </button>
+          ) : (
+            <button
+              onClick={handleAutoLoginAll}
+              disabled={allAlreadyAuth}
+              className={`text-xs px-3.5 py-1.5 rounded-xl font-bold transition-all flex items-center gap-2 shadow-xs select-none ${
+                allAlreadyAuth
+                  ? 'bg-[#14261B] text-[#7EE787] border border-[#1E4A30] opacity-80 cursor-not-allowed'
+                  : 'bg-gradient-to-r from-[#8C6D19] via-[#B8860B] to-[#C59B27] hover:brightness-110 text-[#141210] border border-[#DFC068]/40 cursor-pointer'
+              }`}
+              title={
+                allAlreadyAuth
+                  ? 'Todas as contas atribuídas já estão autenticadas no sistema.'
+                  : 'Iniciar login automático em segundo plano para todas as contas ativas com skip em caso de erro'
+              }
+            >
+              {allAlreadyAuth ? (
+                <>
+                  <span>✅</span>
+                  <span>Todas as Contas Autenticadas</span>
+                </>
+              ) : (
+                <>
+                  <span>🚀</span>
+                  <span>Iniciar Auto-Login (2º Plano)</span>
+                </>
+              )}
+            </button>
+          )}
 
           <div className="text-xs bg-[#1C1815] border border-[#383028] text-[#D5C9B8] px-3 py-1.5 rounded-xl font-medium">
             <span className="font-bold text-[#DFC068]">{groupedProfiles.length}</span> perfis ({totalChannels} canais conectados)

@@ -1,0 +1,53 @@
+name: Build macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (ex: v1.4.50)'
+        required: true
+        default: 'v1.4.50'
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build:electron
+
+      - name: Build macOS packages
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npx electron-builder --mac zip --x64 --arm64
+
+      - name: List build artifacts
+        run: ls -la release/
+
+      - name: Upload to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for file in release/*.zip; do
+            echo "Uploading $file..."
+            gh release upload ${{ github.event.inputs.version }} "$file" --clobber || true
+          done
+
+      - name: Upload artifacts (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-builds
+          path: release/*.zip
+          retention-days: 30

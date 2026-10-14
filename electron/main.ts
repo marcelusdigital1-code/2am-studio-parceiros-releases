@@ -226,6 +226,14 @@ let tray: Tray | null = null;
 let isQuitting = false;
 let hasShownTrayNotification = false;
 
+function dispatch2FARequest(payload: any, fallbackSender?: Electron.WebContents) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('chrome-request-2fa', payload);
+  } else if (fallbackSender && !fallbackSender.isDestroyed()) {
+    fallbackSender.send('chrome-request-2fa', payload);
+  }
+}
+
 // ── Chrome Real Management ──────────────────────────────────────────
 interface ChromeSession {
   process: ChildProcess;
@@ -233,6 +241,7 @@ interface ChromeSession {
   ws: WebSocket | null;
   debugPort: number;
   email?: string;
+  googleEmail?: string;
   pass?: string;
   birthDate?: string;
   partnerId?: string;
@@ -251,6 +260,7 @@ interface ChromeSession {
   runInBackground?: boolean;
   isQueueLogin?: boolean;
   launchedAt?: number;
+  isPublishing?: boolean;
 }
 
 const chromeSessions = new Map<string, ChromeSession>();
@@ -720,6 +730,16 @@ async function restoreFacebookCookies(ws: WebSocket, profileDir: string): Promis
 }
 
 async function closeChromeSessionGracefully(session: ChromeSession, profileId: string, eventSender?: any) {
+  // Salvar cookies do Facebook antes de qualquer fechamento do WebSocket e processo
+  if (session.platform === 'facebook' && session.ws && session.ws.readyState === WebSocket.OPEN) {
+    try {
+      console.log(`[FACEBOOK] Salvando cookies antes do encerramento para ${session.profileDir}...`);
+      await saveFacebookCookies(session.ws, session.profileDir);
+    } catch (e) {
+      console.warn('[FACEBOOK] Erro ao salvar cookies em closeChromeSessionGracefully:', e);
+    }
+  }
+
   try {
     if (session.debugPort) {
       // Enviar Browser.close para o target Browser oficial (/json/version) para checkpoint do SQLite e flush dos cookies
@@ -775,9 +795,6 @@ async function closeChromeSessionGracefully(session: ChromeSession, profileId: s
     }
   }
 
-  if (session.platform === 'facebook' && session.ws && session.ws.readyState === WebSocket.OPEN) {
-    try { await saveFacebookCookies(session.ws, session.profileDir); } catch (_) {}
-  }
   if (session.platform === 'facebook') {
     const partnerFbKeys: string[] = [];
     for (const [k, s] of chromeSessions.entries()) {
@@ -1137,6 +1154,7 @@ function attachSecurityListenersToWs(
           gender: session.gender,
           lastCode: session.lastCode,
           pageUrl: session.pageUrl || '',
+          isPublishing: Boolean(session.isPublishing),
         });
         cdpSend(ws, 'Runtime.evaluate', { expression: shield }).catch(() => {});
 
@@ -1202,9 +1220,7 @@ function attachSecurityListenersToWs(
               navUrl.includes('/monetization') || navUrl.includes('/payouts') ||
               navUrl.includes('/billing') || navUrl.includes('/settings') ||
               navUrl.includes('accountscenter') ||
-              navUrl === 'https://www.facebook.com' || navUrl === 'https://www.facebook.com/' ||
-              navUrl.startsWith('https://www.facebook.com/?') ||
-              navUrl.includes('/me') || navUrl.includes('/friends') || navUrl.includes('/groups');
+              navUrl.includes('/security') || navUrl.includes('/privacy');
             // Só redirecionar se o usuário já estiver logado (evita loop infinito de redirecionamentos)
             if (isFbRestricted && session.isLoggedIn && !session.isSignup) {
               console.log(`[SECURITY] Facebook URL proibida (${navUrl}) -> Redirecionando para ${safeFb}`);
@@ -1243,13 +1259,18 @@ function getNextDebugPort(): number {
 }
 
 function isChromeInstalled(): { installed: boolean; path?: string } {
-  const candidates = [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
-    path.join(process.env.PROGRAMFILES || '', 'Google\\Chrome\\Application\\chrome.exe'),
-    path.join(process.env['PROGRAMFILES(X86)'] || '', 'Google\\Chrome\\Application\\chrome.exe'),
-  ];
+  const candidates = process.platform === 'darwin'
+    ? [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        path.join(os.homedir(), 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+      ]
+    : [
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
+        path.join(process.env.PROGRAMFILES || '', 'Google\\Chrome\\Application\\chrome.exe'),
+        path.join(process.env['PROGRAMFILES(X86)'] || '', 'Google\\Chrome\\Application\\chrome.exe'),
+      ];
   for (const p of candidates) {
     try {
       fsSync.accessSync(p);
@@ -1264,7 +1285,7 @@ function findChromePath(): string {
   if (check.installed && check.path) {
     return check.path;
   }
-  return 'chrome';
+  return process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : 'chrome';
 }
 
 function generateId(): string {
@@ -1275,19 +1296,21 @@ function cdpSend(
   ws: WebSocket,
   method: string,
   params?: Record<string, unknown>,
-  sessionId?: string
+  sessionId?: string,
+  customTimeoutMs?: number
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return reject(new Error(`CDP socket is not open (readyState: ${ws ? ws.readyState : 'null'})`));
+    }
     const id = ++globalCdpId;
-    const timeout = setTimeout(
-      () => reject(new Error(`CDP timeout: ${method}`)),
-      15000
-    );
+    const timeoutDuration = customTimeoutMs || 25000;
+    let timeout: NodeJS.Timeout | null = null;
     const handler = (raw: WebSocket.Data) => {
       try {
         const msg = JSON.parse(raw.toString());
         if (msg.id === id) {
-          clearTimeout(timeout);
+          if (timeout) clearTimeout(timeout);
           ws.removeListener('message', handler);
           if (msg.error) {
             reject(new Error(msg.error.message || 'CDP error'));
@@ -1297,14 +1320,19 @@ function cdpSend(
         }
       } catch {}
     };
+    timeout = setTimeout(() => {
+      try { ws.removeListener('message', handler); } catch (_) {}
+      reject(new Error(`CDP timeout: ${method}`));
+    }, timeoutDuration);
+
     ws.on('message', handler);
     try {
       const payload: Record<string, unknown> = { id, method, params };
       if (sessionId) payload.sessionId = sessionId;
       ws.send(JSON.stringify(payload));
     } catch (err) {
-      clearTimeout(timeout);
-      ws.removeListener('message', handler);
+      if (timeout) clearTimeout(timeout);
+      try { ws.removeListener('message', handler); } catch (_) {}
       reject(err);
     }
   });
@@ -1458,39 +1486,63 @@ function getExecutableScriptPath(scriptName: string): string | null {
   return null;
 }
 
-// ── Helper: Ocultar / Mostrar processo do Chrome na Barra de Tarefas do Windows ──
+// ── Helper: Ocultar / Mostrar processo do Chrome na Barra de Tarefas (Windows) ou Dock (macOS) ──
 function setProcessTaskbarVisibility(pid?: number, show: boolean = false) {
-  if (!pid || process.platform !== 'win32') return;
-  const targetScript = getExecutableScriptPath('hideTaskbar.ps1');
-  if (targetScript) {
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    const targetScript = getExecutableScriptPath('hideTaskbar.ps1');
+    if (targetScript) {
+      try {
+        const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', targetScript, '-TargetPid', String(pid)];
+        if (show) args.push('-Show');
+        spawn('powershell.exe', args, {
+          windowsHide: true,
+          stdio: 'ignore',
+          detached: true,
+        }).unref();
+      } catch {}
+    }
+  } else if (process.platform === 'darwin') {
+    // No macOS: ocultar/mostrar Chrome via AppleScript
     try {
-      const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', targetScript, '-TargetPid', String(pid)];
-      if (show) args.push('-Show');
-      spawn('powershell.exe', args, {
-        windowsHide: true,
-        stdio: 'ignore',
-        detached: true,
-      }).unref();
+      const script = show
+        ? 'tell application "System Events" to set visible of process "Google Chrome" to true'
+        : 'tell application "System Events" to set visible of process "Google Chrome" to false';
+      spawn('osascript', ['-e', script], { stdio: 'ignore', detached: true }).unref();
     } catch {}
   }
 }
 
 // ── Helper: Garantir que qualquer janela ou popup do Chrome permaneça fora da tela em segundo plano ──
 function startBackgroundWindowKeeper(pid?: number) {
-  if (!pid || process.platform !== 'win32') return;
-  const targetScript = getExecutableScriptPath('backgroundWindowKeeper.ps1');
-  if (targetScript) {
-    try {
-      const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', targetScript, '-TargetPid', String(pid)];
-      spawn('powershell.exe', args, {
-        windowsHide: true,
-        stdio: 'ignore',
-        detached: true,
-      }).unref();
-      console.log(`[BACKGROUND] backgroundWindowKeeper iniciado para PID ${pid}`);
-    } catch (e) {
-      console.warn('[BACKGROUND] Erro ao iniciar backgroundWindowKeeper:', e);
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    const targetScript = getExecutableScriptPath('backgroundWindowKeeper.ps1');
+    if (targetScript) {
+      try {
+        const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', targetScript, '-TargetPid', String(pid)];
+        spawn('powershell.exe', args, {
+          windowsHide: true,
+          stdio: 'ignore',
+          detached: true,
+        }).unref();
+        console.log(`[BACKGROUND] backgroundWindowKeeper iniciado para PID ${pid}`);
+      } catch (e) {
+        console.warn('[BACKGROUND] Erro ao iniciar backgroundWindowKeeper:', e);
+      }
     }
+  } else if (process.platform === 'darwin') {
+    // No macOS: periodicamente ocultar Chrome (a cada 3s por 30s)
+    let count = 0;
+    const interval = setInterval(() => {
+      if (count++ >= 10) { clearInterval(interval); return; }
+      try {
+        spawn('osascript', ['-e',
+          'tell application "System Events" to set visible of process "Google Chrome" to false'
+        ], { stdio: 'ignore', detached: true }).unref();
+      } catch {}
+    }, 3000);
+    console.log(`[BACKGROUND] backgroundWindowKeeper (macOS) iniciado para PID ${pid}`);
   }
 }
 
@@ -1666,12 +1718,17 @@ function createMainWindow() {
 
       if (!hasShownTrayNotification) {
         hasShownTrayNotification = true;
-        if (tray && typeof tray.displayBalloon === 'function') {
+        if (process.platform === 'win32' && tray && typeof tray.displayBalloon === 'function') {
           tray.displayBalloon({
             title: '2AM Studio Parceiros',
             content: 'O 2AM Studio Parceiros continua ativo em segundo plano para publicações e sincronização.',
             iconType: 'info',
           });
+        } else if (Notification.isSupported()) {
+          new Notification({
+            title: '2AM Studio Parceiros',
+            body: 'O 2AM Studio Parceiros continua ativo em segundo plano para publicações e sincronização.',
+          }).show();
         }
       }
       return false;
@@ -1816,59 +1873,10 @@ ipcMain.on('show-notification', (_event, { title, body }: { title?: string; body
   }
 });
 
-// IPC: Mostrar sessão Chrome ao parceiro (traz a janela para a frente)
-ipcMain.handle('show-chrome-session', async (_event, accountCode: string) => {
-  // Procura a sessão activa (por accountCode ou qualquer chave que contenha o código)
-  let session = chromeSessions.get(accountCode);
-  if (!session) {
-    // Fallback: procurar por prefixo parcial
-    for (const [key, s] of chromeSessions.entries()) {
-      if (key.includes(accountCode) || accountCode.includes(key)) {
-        session = s;
-        break;
-      }
-    }
-  }
-  if (!session) {
-    return { success: false, error: 'Sessão não encontrada ou Chrome não está em execução.' };
-  }
-  try {
-    // Pede ao Chrome para reposicionar para as coordenadas visíveis e trazer a aba para a frente via CDP
-    if (session.ws && session.ws.readyState === WebSocket.OPEN) {
-      try {
-        const boundsRes = (await cdpSend(session.ws, 'Browser.getWindowForTarget')) as { windowId?: number };
-        if (boundsRes?.windowId) {
-          await cdpSend(session.ws, 'Browser.setWindowBounds', {
-            windowId: boundsRes.windowId,
-            bounds: { windowState: 'normal', left: 100, top: 100, width: 1200, height: 810 }
-          });
-        }
-      } catch {}
-      setProcessTaskbarVisibility(session.process?.pid, true);
-      await new Promise<void>((resolve) => {
-        const msgId = Math.floor(Math.random() * 999999);
-        const msg = JSON.stringify({ id: msgId, method: 'Page.bringToFront', params: {} });
-        session!.ws!.send(msg);
-        setTimeout(resolve, 300);
-      });
-    }
-    // No Windows, foca o processo Chrome pelo PID (traz para frente mesmo se minimizado)
-    if (session.process?.pid && process.platform === 'win32') {
-      const { execSync } = await import('child_process');
-      try {
-        // PowerShell one-liner: foca a janela cujo processo tem o PID dado
-        execSync(
-          `powershell -NoProfile -Command "& { $h = (Get-Process -Id ${session.process.pid} -ErrorAction SilentlyContinue).MainWindowHandle; if ($h) { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class W { [DllImport(\\"user32.dll\\")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport(\\"user32.dll\\")] public static extern bool ShowWindow(IntPtr h,int n); }'; [W]::ShowWindow($h, 9); [W]::SetForegroundWindow($h) } }"`,
-          { timeout: 3000 }
-        );
-      } catch {
-        // Falha silenciosa — a aba CDP já foi trazida para frente
-      }
-    }
-    return { success: true };
-  } catch (err: unknown) {
-    return { success: false, error: err instanceof Error ? err.message : 'Erro desconhecido' };
-  }
+// IPC: Mostrar sessão Chrome ao parceiro (bloqueado: publicação executada estritamente em segundo plano)
+ipcMain.handle('show-chrome-session', async (_event, _accountCode: string) => {
+  console.log(`[SHOW CHROME] Pré-visualização desativada: publicação executada estritamente em segundo plano.`);
+  return { success: false, error: 'A publicação automática é executada estritamente em segundo plano. Pré-visualização de janela desativada.' };
 });
 
 // ── IPC: Iniciar Transmissão de Tela em Tempo Real (CDP Screencast) ──
@@ -2023,11 +2031,15 @@ ipcMain.handle('stop-remote-stream', async (event, { accountCode }: { accountCod
         try { session.process.kill(); } catch {}
       }
 
-      // No Windows, garantir que toda a árvore de processos do Chrome é finalizada
-      if (pid && process.platform === 'win32') {
+      // Garantir que toda a árvore de processos do Chrome é finalizada
+      if (pid) {
         try {
           const { execSync } = await import('child_process');
-          execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' });
+          if (process.platform === 'win32') {
+            execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' });
+          } else {
+            execSync(`kill -9 ${pid}`, { stdio: 'ignore' });
+          }
         } catch {}
       }
 
@@ -2404,7 +2416,8 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
       ? 'https://studio.youtube.com/'
       : 'https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fstudio.youtube.com%2F';
     isYouTubeLogin = !hasAuthenticatedYt;
-    runInBackground = false; // YouTube sempre visível para o parceiro
+    // YouTube login agora executa em segundo plano com Emulation.setFocusEmulationEnabled
+    // runInBackground mantém o valor solicitado (ou true por predefinição)
   }
 
   // 1. Impedir abertura duplicada se o perfil de conta atribuída já estiver em execução no Chrome Real
@@ -2454,10 +2467,26 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
             console.error('Erro ao navegar Chrome via CDP:', err);
           }
         }
-        try {
-          cdpSend(existingSession.ws, 'Page.bringToFront');
-        } catch (err) {
-          console.error('Erro ao focar Chrome via CDP:', err);
+        if (!runInBackground) {
+          try {
+            cdpSend(existingSession.ws, 'Page.bringToFront');
+          } catch (err) {
+            console.error('Erro ao focar Chrome via CDP:', err);
+          }
+        } else {
+          try {
+            const winTarget: any = await cdpSend(existingSession.ws, 'Browser.getWindowForTarget', {}).catch(() => null);
+            if (winTarget?.windowId != null) {
+              await cdpSend(existingSession.ws, 'Browser.setWindowBounds', {
+                windowId: winTarget.windowId,
+                bounds: { left: -32000, top: -32000, width: 1200, height: 810, windowState: 'normal' }
+              }).catch(() => {});
+            }
+          } catch (_) {}
+          if (existingSession.process?.pid) {
+            startBackgroundWindowKeeper(existingSession.process.pid);
+            setProcessTaskbarVisibility(existingSession.process.pid, false);
+          }
         }
         chromeSessions.set(profileId, existingSession);
         event.sender.send('chrome-already-running', { profileId });
@@ -2505,7 +2534,23 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
             if (targetNavUrl) {
               try { cdpSend(ws, 'Page.navigate', { url: targetNavUrl }); } catch {}
             }
-            try { cdpSend(ws, 'Page.bringToFront'); } catch {}
+            if (!runInBackground) {
+              try { cdpSend(ws, 'Page.bringToFront'); } catch {}
+            } else {
+              try {
+                const winTarget: any = await cdpSend(ws, 'Browser.getWindowForTarget', {}).catch(() => null);
+                if (winTarget?.windowId != null) {
+                  await cdpSend(ws, 'Browser.setWindowBounds', {
+                    windowId: winTarget.windowId,
+                    bounds: { left: -32000, top: -32000, width: 1200, height: 810, windowState: 'normal' }
+                  }).catch(() => {});
+                }
+              } catch (_) {}
+              if (existingSession.process?.pid) {
+                startBackgroundWindowKeeper(existingSession.process.pid);
+                setProcessTaskbarVisibility(existingSession.process.pid, false);
+              }
+            }
             chromeSessions.set(profileId, existingSession);
             event.sender.send('chrome-already-running', { profileId });
             event.sender.send('chrome-ready', { profileId });
@@ -2561,7 +2606,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
         '--lang=pt-PT',
         ...(runInBackground
           ? [
-              '--window-position=5000,5000',
+              '--window-position=-32000,-32000',
               '--window-size=1280,850',
               '--disable-background-timer-throttling',
               '--disable-backgrounding-occluded-windows',
@@ -2585,7 +2630,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
         '--disable-dev-tools',
         '--disable-debugging-keyboard-shortcuts',
         '--lang=pt-PT',
-        ...(runInBackground ? ['--window-position=5000,5000'] : []),
+        ...(runInBackground ? ['--window-position=-32000,-32000'] : []),
         '--window-size=1200,810',
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
@@ -2611,6 +2656,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
     startBackgroundWindowKeeper(chromeProcess.pid);
     setTimeout(() => setProcessTaskbarVisibility(chromeProcess.pid, false), 800);
     setTimeout(() => setProcessTaskbarVisibility(chromeProcess.pid, false), 2000);
+    setTimeout(() => setProcessTaskbarVisibility(chromeProcess.pid, false), 4000);
     // Manter a janela do aplicativo 2AM Studio Parceiros no topo para que o Chrome execute discretamente atrás sem roubar o foco do usuário
     setTimeout(() => {
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -2634,6 +2680,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
     ws: null,
     debugPort,
     email,
+    googleEmail,
     pass,
     birthDate,
     partnerId,
@@ -2701,6 +2748,24 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
               ws.on('open', async () => {
                 retries = 0;
                 try {
+                  if (runInBackground) {
+                    try {
+                      const winTarget: any = await cdpSend(ws, 'Browser.getWindowForTarget', {}).catch(() => null);
+                      if (winTarget?.windowId != null) {
+                        await cdpSend(ws, 'Browser.setWindowBounds', {
+                          windowId: winTarget.windowId,
+                          bounds: { left: -32000, top: -32000, width: 1200, height: 810, windowState: 'normal' }
+                        }).catch(() => {});
+                      }
+                    } catch (_) {}
+                    if (session.process?.pid) {
+                      startBackgroundWindowKeeper(session.process.pid);
+                      setProcessTaskbarVisibility(session.process.pid, false);
+                    }
+                    await cdpSend(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+                    await cdpSend(ws, 'DOM.enable').catch(() => {});
+                  }
+
                   const isCleanLogin = isTikTokLogin || isInstagramLogin || isFacebookLogin || isYouTubeLogin;
                   if (!isCleanLogin) {
                     // Modo normal: ativar todos os protocolos CDP necessários para blindagem
@@ -2794,9 +2859,9 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                         session.isLoggedIn = true;
                         console.log(`[FACEBOOK-RESTORE] Cookies do Facebook restaurados com sucesso para ${profileDirName}!`);
                       }
-                      if (hasAuthenticatedFb) {
+                      if (restored || hasAuthenticatedFb) {
                         const targetFbUrl = (session.pageUrl && session.pageUrl.trim()) ? session.pageUrl.trim() : (signupUrl && !signupUrl.includes('/login') ? signupUrl : 'https://web.facebook.com/pages/');
-                        console.log(`[FACEBOOK] Sessão já autenticada. Navegando para página atribuída: ${targetFbUrl}`);
+                        console.log(`[FACEBOOK] Sessão autenticada / cookies restaurados. Navegando para página: ${targetFbUrl}`);
                         await cdpSend(ws, 'Page.navigate', { url: targetFbUrl }).catch(() => {});
                         event.sender.send('chrome-auth-status', { profileId, isLoggedIn: true });
                         mainWindow?.webContents.send('chrome-auth-status', { profileId, isLoggedIn: true });
@@ -2872,6 +2937,9 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                       // Bloquear atalhos perigosos (Ctrl+T, Ctrl+N, Ctrl+R, Shift+Esc, etc.) — não interfere com automação CDP
                       await cdpSend(ws, 'Runtime.evaluate', { expression: KEYBOARD_BLOCKER_SCRIPT }).catch(() => {});
                       await cdpSend(ws, 'Page.addScriptToEvaluateOnNewDocument', { source: KEYBOARD_BLOCKER_SCRIPT }).catch(() => {});
+                      if (runInBackground) {
+                        await cdpSend(ws, 'Target.setDiscoverTargets', { discover: true }).catch(() => {});
+                      }
                     } else {
                       console.log(`[${isTikTokLogin ? 'TIKTOK' : isInstagramLogin ? 'INSTAGRAM' : 'FACEBOOK'}] Modo login iniciado para perfil ${profileId}. Navegador 100% limpo e autêntico.`);
                       if (isTikTokLogin) {
@@ -2883,6 +2951,15 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                         await cdpSend(ws, 'Page.addScriptToEvaluateOnNewDocument', { source: KEYBOARD_BLOCKER_SCRIPT }).catch(() => {});
                         // Ativar descoberta de targets para poder fechar novas janelas abertas pelo parceiro (ex: "Abrir janela do browser")
                         // sem afetar o popup Google OAuth que é aberto internamente pelo Chrome
+                        await cdpSend(ws, 'Target.setDiscoverTargets', { discover: true }).catch(() => {});
+                      } else if (runInBackground) {
+                        // Para Facebook e Instagram em segundo plano:
+                        // Ativar CDP essencial para bloqueio de novas janelas ("Abrir janela do browser") e atalhos de teclado
+                        await cdpSend(ws, 'Page.enable').catch(() => {});
+                        await cdpSend(ws, 'Runtime.enable').catch(() => {});
+                        await cdpSend(ws, 'Network.enable').catch(() => {});
+                        await cdpSend(ws, 'Runtime.evaluate', { expression: KEYBOARD_BLOCKER_SCRIPT }).catch(() => {});
+                        await cdpSend(ws, 'Page.addScriptToEvaluateOnNewDocument', { source: KEYBOARD_BLOCKER_SCRIPT }).catch(() => {});
                         await cdpSend(ws, 'Target.setDiscoverTargets', { discover: true }).catch(() => {});
                       }
                     }
@@ -3887,9 +3964,8 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           const nowTs = Date.now();
                           if (nowTs - lastTikTok2FANotifTime > 45000) {
                             lastTikTok2FANotifTime = nowTs;
-                            console.log('[TIKTOK-VERIFY] Tela de código de verificação detectada! Disparando chrome-request-2fa para o ADM...');
-                            event.sender.send('chrome-request-2fa', { profileId, partnerId, platform: 'tiktok' });
-                            mainWindow?.webContents.send('chrome-request-2fa', { profileId, partnerId, platform: 'tiktok' });
+                            console.log('[TIKTOK-VERIFY] Tela de código de verificação detectada! Disparando chrome-request-2fa (e-mail) para o ADM...');
+                            dispatch2FARequest({ profileId, partnerId, platform: 'tiktok', codeType: 'email_code', accountId: session.accountId, email: session.email }, event.sender);
                           }
 
                           const incomingCode = (session.lastCode || '').trim();
@@ -3991,6 +4067,82 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                             session.lastCode = '';
                             await new Promise(r => setTimeout(r, 3000));
+
+                            // 🔍 Requisito: Verificar se o TikTok acusou código incorreto ou expirado
+                            const checkTtCodeError: any = await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                try {
+                                  var ttErrorPhrases = [
+                                    'código de verificação incorreto',
+                                    'incorrect verification code',
+                                    'código incorreto',
+                                    'código inválido',
+                                    'invalid code',
+                                    'código expirado',
+                                    'code expired',
+                                    'código de verificação expirou',
+                                    'máximo de tentativas excedido',
+                                    'too many attempts'
+                                  ];
+                                  var isTtError = false;
+                                  var ttErrMsg = '';
+                                  var allText = (document.body ? (document.body.innerText || '') : '').toLowerCase();
+                                  for (var t = 0; t < ttErrorPhrases.length; t++) {
+                                    if (allText.includes(ttErrorPhrases[t])) {
+                                      isTtError = true;
+                                      ttErrMsg = ttErrorPhrases[t];
+                                      break;
+                                    }
+                                  }
+
+                                  var alertEl = document.querySelector('[role="alert"], div[class*="error" i], p[class*="error" i]');
+                                  if (alertEl) {
+                                    var alertTxt = (alertEl.innerText || '').toLowerCase();
+                                    for (var t = 0; t < ttErrorPhrases.length; t++) {
+                                      if (alertTxt.includes(ttErrorPhrases[t])) {
+                                        isTtError = true;
+                                        ttErrMsg = alertEl.innerText;
+                                        break;
+                                      }
+                                    }
+                                  }
+
+                                  var inputStillPresent = !!document.querySelector('input[data-e2e="verify-input"], input[name*="code" i], input[maxlength="1"]');
+                                  if (isTtError && inputStillPresent) {
+                                    return { isError: true, message: ttErrMsg || 'Código de verificação incorreto ou expirado no TikTok' };
+                                  }
+                                  return { isError: false };
+                                } catch(e) { return { isError: false }; }
+                              })()`,
+                              returnByValue: true
+                            }, targetSessionId).catch(() => null);
+
+                            if (checkTtCodeError?.result?.value?.isError) {
+                              const errMsg = checkTtCodeError.result.value.message || 'Código de verificação incorreto ou expirado no TikTok';
+                              console.warn(`[TIKTOK-VERIFY] ❌ Código incorreto detectado: "${errMsg}". Re-notificando ADM imediatamente...`);
+                              setBadge('⚠️ Código 2FA incorreto! Solicitando novo código ao ADM...', '#ef4444');
+                              session.lastCode = '';
+                              // Limpar campos de input
+                              await cdpSend(ws, 'Runtime.evaluate', {
+                                expression: `(function() {
+                                  try {
+                                    var inputs = document.querySelectorAll('input');
+                                    inputs.forEach(function(inp) {
+                                      try {
+                                        inp.value = '';
+                                        var t = inp._valueTracker; if (t) t.setValue('');
+                                        inp.dispatchEvent(new Event('input', { bubbles: true }));
+                                        inp.dispatchEvent(new Event('change', { bubbles: true }));
+                                      } catch(_) {}
+                                    });
+                                  } catch(_) {}
+                                })()`
+                              }, targetSessionId).catch(() => null);
+                              lastTikTok2FANotifTime = 0; // Resetar throttle
+                              dispatch2FARequest({ profileId, partnerId, platform: 'tiktok', codeType: 'email_code', isRetry: true, errorMessage: errMsg, accountId: session.accountId, email: session.email }, event.sender);
+                              return 'waiting_code';
+                            }
+
                             return 'typed_code';
                           }
 
@@ -4154,8 +4306,24 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                       // Ativar protocolos CDP no alvo (idêntico ao YouTube)
                       await cdpSend(wsTarget, 'Page.enable').catch(() => {});
                       await cdpSend(wsTarget, 'Runtime.enable').catch(() => {});
+                      await cdpSend(wsTarget, 'DOM.enable').catch(() => {});
+                      await cdpSend(wsTarget, 'Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
                       if (!runInBackground) {
                         await cdpSend(wsTarget, 'Page.bringToFront').catch(() => {});
+                      } else {
+                        try {
+                          const winForTarget: any = await cdpSend(wsTarget, 'Browser.getWindowForTarget', {}).catch(() => null);
+                          if (winForTarget?.windowId != null) {
+                            await cdpSend(wsTarget, 'Browser.setWindowBounds', {
+                              windowId: winForTarget.windowId,
+                              bounds: { left: -32000, top: -32000, width: 1200, height: 810, windowState: 'normal' }
+                            }).catch(() => {});
+                          }
+                        } catch (_) {}
+                        if (session.process?.pid) {
+                          startBackgroundWindowKeeper(session.process.pid);
+                          setProcessTaskbarVisibility(session.process.pid, false);
+                        }
                       }
 
                       // Aguardo reativo inicial (máx 3.5s)
@@ -4545,6 +4713,14 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           setBadge('Preenchendo e-mail protegido...', '#38bdf8');
 
                           if (pa.inputCoords) {
+                            // Assegurar foco no elemento
+                            await cdpSend(wsTarget, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[type="email"], #identifierId, input[name="identifier"], input[autocomplete="username"]');
+                                if (el) { el.focus(); }
+                              })()`
+                            }).catch(() => {});
+
                             await realClickAt(pa.inputCoords.x, pa.inputCoords.y, undefined, wsTarget);
                             await new Promise(r => setTimeout(r, 400));
 
@@ -4558,6 +4734,22 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             // Digitar via typeHuman idêntico ao YouTube (sem interferir no DOM)
                             await typeHuman(effUser, undefined, wsTarget);
                             await new Promise(r => setTimeout(r, 500));
+
+                            // Garantir preenchimento seguro mesmo em segundo plano
+                            await cdpSend(wsTarget, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[type="email"], #identifierId, input[name="identifier"], input[autocomplete="username"]');
+                                if (el && (!el.value || el.value.trim().length === 0)) {
+                                  el.focus();
+                                  document.execCommand('insertText', false, ${JSON.stringify(effUser)});
+                                  if (!el.value) {
+                                    el.value = ${JSON.stringify(effUser)};
+                                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                                  }
+                                }
+                              })()`
+                            }).catch(() => {});
                           }
 
                           if (pa.btnCoords) {
@@ -4589,6 +4781,14 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           setBadge('Preenchendo senha protegida...', '#38bdf8');
 
                           if (pa.inputCoords) {
+                            // Assegurar foco no elemento de senha
+                            await cdpSend(wsTarget, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[type="password"], input[name="Passwd"], input[name="password"], input[autocomplete="current-password"]');
+                                if (el) { el.focus(); }
+                              })()`
+                            }).catch(() => {});
+
                             await realClickAt(pa.inputCoords.x, pa.inputCoords.y, undefined, wsTarget);
                             await new Promise(r => setTimeout(r, 400));
 
@@ -4601,6 +4801,22 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             // Digitar via typeHuman idêntico ao YouTube
                             await typeHuman(effPass, undefined, wsTarget);
                             await new Promise(r => setTimeout(r, 500));
+
+                            // Garantir preenchimento seguro de senha mesmo em segundo plano
+                            await cdpSend(wsTarget, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[type="password"], input[name="Passwd"], input[name="password"], input[autocomplete="current-password"]');
+                                if (el && (!el.value || el.value.trim().length === 0)) {
+                                  el.focus();
+                                  document.execCommand('insertText', false, ${JSON.stringify(effPass)});
+                                  if (!el.value) {
+                                    el.value = ${JSON.stringify(effPass)};
+                                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                                  }
+                                }
+                              })()`
+                            }).catch(() => {});
                           }
 
                           if (pa.btnCoords) {
@@ -4720,12 +4936,12 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                         // F. 2FA
                         if (pa?.action === 'google_2fa') {
-                          setBadge('🔑 Aguardando código 2FA...', '#f59e0b');
+                          sec = 0; // 🛑 Requisito: Espera infinita enquanto aguarda código do ADM (sem timeout)
+                          setBadge('🔑 Aguardando código 2FA do Administrador...', '#f59e0b');
                           const nowTs = Date.now();
-                          if (nowTs - lastNotifTime > 120000) {
+                          if (nowTs - lastNotifTime > 60000) {
                             lastNotifTime = nowTs;
-                            event.sender.send('chrome-request-2fa', { profileId, partnerId, platform: 'tiktok' });
-                            mainWindow?.webContents.send('chrome-request-2fa', { profileId, partnerId, platform: 'tiktok' });
+                            dispatch2FARequest({ profileId, partnerId, platform: 'tiktok', codeType: 'google_totp', accountId: session.accountId, email: googleEmail || session.email }, event.sender);
                           }
                           const incomingCode = (session.lastCode || '').trim();
                           if (incomingCode && incomingCode.length >= 4) {
@@ -4749,6 +4965,77 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                               await cdpSend(wsTarget, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, key: 'Enter', code: 'Enter' }).catch(() => {});
                             }
                             await new Promise(r => setTimeout(r, 4000));
+
+                            // 🔍 Requisito: Verificar se o Google acusou código 2FA incorreto ou expirado
+                            const checkGoogleCodeError: any = await cdpSend(wsTarget, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                try {
+                                  var errorPhrases = [
+                                    'código incorreto',
+                                    'código de verificação incorreto',
+                                    'código errado',
+                                    'wrong code',
+                                    'incorrect code',
+                                    'não foi possível verificar seu código',
+                                    "couldn't verify your code",
+                                    'muitas tentativas',
+                                    'too many attempts',
+                                    'código expirado',
+                                    'code expired'
+                                  ];
+                                  var isCodeError = false;
+                                  var errMsg = '';
+
+                                  var explicitErrorEl = document.querySelector('#error, .o6cuMc, [jsname="B34EJ"]');
+                                  var liveEl = document.querySelector('[aria-live="assertive"]');
+                                  var checkTxt = ((explicitErrorEl ? (explicitErrorEl.innerText || '') : '') + ' ' + (liveEl ? (liveEl.innerText || '') : '')).toLowerCase();
+
+                                  for (var ep = 0; ep < errorPhrases.length; ep++) {
+                                    if (checkTxt.includes(errorPhrases[ep])) {
+                                      isCodeError = true;
+                                      errMsg = errorPhrases[ep];
+                                      break;
+                                    }
+                                  }
+
+                                  if (!isCodeError) {
+                                    var allText = (document.body ? (document.body.innerText || '') : '').toLowerCase();
+                                    for (var ep = 0; ep < errorPhrases.length; ep++) {
+                                      if (allText.includes(errorPhrases[ep])) {
+                                        isCodeError = true;
+                                        errMsg = errorPhrases[ep];
+                                        break;
+                                      }
+                                    }
+                                  }
+
+                                  var hasInputStillVisible = !!document.querySelector('input[type="tel"], input[name*="code" i], #idvPin, #totpPin');
+                                  if (isCodeError && hasInputStillVisible) {
+                                    return { isError: true, message: errMsg || 'Código 2FA incorreto ou expirado' };
+                                  }
+                                  return { isError: false };
+                                } catch(e) { return { isError: false }; }
+                              })()`,
+                              returnByValue: true
+                            }).catch(() => null);
+
+                            if (checkGoogleCodeError?.result?.value?.isError) {
+                              const errMsg = checkGoogleCodeError.result.value.message || 'Código 2FA incorreto ou expirado';
+                              console.warn(`[TIKTOK-GOOGLE-2FA] ❌ Código 2FA incorreto detectado: "${errMsg}". Re-notificando ADM imediatamente...`);
+                              setBadge('⚠️ Código 2FA incorreto! Solicitando novo código ao ADM...', '#ef4444');
+                              session.lastCode = '';
+                              if (pa.inputCoords) {
+                                await realClickAt(pa.inputCoords.x, pa.inputCoords.y, undefined, wsTarget);
+                                await cdpSend(wsTarget, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 65, key: 'a', code: 'KeyA', modifiers: 2 }).catch(() => {});
+                                await cdpSend(wsTarget, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 65, key: 'a', code: 'KeyA' }).catch(() => {});
+                                await cdpSend(wsTarget, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 8, key: 'Backspace', code: 'Backspace' }).catch(() => {});
+                                await cdpSend(wsTarget, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 8, key: 'Backspace', code: 'Backspace' }).catch(() => {});
+                              }
+                              lastNotifTime = Date.now();
+                              dispatch2FARequest({ profileId, partnerId, platform: 'tiktok', codeType: 'google_totp', isRetry: true, errorMessage: errMsg, accountId: session.accountId, email: googleEmail || session.email }, event.sender);
+                              continue;
+                            }
+
                             continue;
                           }
                           await new Promise(r => setTimeout(r, 2000));
@@ -4773,6 +5060,26 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                       let loginFlowStarted = false;
                       googleLoginDone = false;
                       googleLoginDoneAt = 0;
+
+                      // ── Garantir foco emulado e janela oculta para execução 100% em segundo plano ──
+                      await cdpSend(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+                      await cdpSend(ws, 'DOM.enable').catch(() => {});
+
+                      if (runInBackground) {
+                        try {
+                          const winTarget: any = await cdpSend(ws, 'Browser.getWindowForTarget', {}).catch(() => null);
+                          if (winTarget?.windowId != null) {
+                            await cdpSend(ws, 'Browser.setWindowBounds', {
+                              windowId: winTarget.windowId,
+                              bounds: { left: -32000, top: -32000, width: 1200, height: 810, windowState: 'normal' }
+                            }).catch(() => {});
+                          }
+                        } catch (_) {}
+                        if (session.process?.pid) {
+                          startBackgroundWindowKeeper(session.process.pid);
+                          setProcessTaskbarVisibility(session.process.pid, false);
+                        }
+                      }
 
                       // ══════════════════════════════════════════════════════════════════
                       // FASE 1: AUTENTICAÇÃO DA CONTA GOOGLE NO SITE OFICIAL
@@ -4901,6 +5208,20 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                               }
                             } catch (_) {}
                             await cdpSend(ws, 'Page.bringToFront').catch(() => {});
+                          } else {
+                            try {
+                              const winForTarget: any = await cdpSend(ws, 'Browser.getWindowForTarget', {}).catch(() => null);
+                              if (winForTarget?.windowId != null) {
+                                await cdpSend(ws, 'Browser.setWindowBounds', {
+                                  windowId: winForTarget.windowId,
+                                  bounds: { left: -32000, top: -32000, width: 1200, height: 810, windowState: 'normal' }
+                                }).catch(() => {});
+                              }
+                            } catch (_) {}
+                            if (session.process?.pid) {
+                              startBackgroundWindowKeeper(session.process.pid);
+                              setProcessTaskbarVisibility(session.process.pid, false);
+                            }
                           }
 
                           const gLoginOk = await runGoogleLoginForTikTok(ws, googleEmail || email, googlePass || pass);
@@ -4947,7 +5268,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             if (winTarget?.windowId != null) {
                               await cdpSend(ws, 'Browser.setWindowBounds', {
                                 windowId: winTarget.windowId,
-                                bounds: { left: 5000, top: 5000, width: 1280, height: 850, windowState: 'normal' }
+                                bounds: { left: -32000, top: -32000, width: 1280, height: 850, windowState: 'normal' }
                               }).catch(() => {});
                             }
                           } catch (_) {}
@@ -4990,6 +5311,8 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             await cdpSend(pWs, 'Page.enable').catch(() => {});
                             await cdpSend(pWs, 'Runtime.enable').catch(() => {});
                             await cdpSend(pWs, 'Network.enable').catch(() => {});
+                            await cdpSend(pWs, 'DOM.enable').catch(() => {});
+                            await cdpSend(pWs, 'Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
 
                             // Mover popup para segundo plano (fora do ecrã) imediatamente
                             try {
@@ -4997,11 +5320,12 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                               if (popupWin?.windowId != null) {
                                 await cdpSend(pWs, 'Browser.setWindowBounds', {
                                   windowId: popupWin.windowId,
-                                  bounds: { left: 5000, top: 5000, width: 1280, height: 850, windowState: 'normal' }
+                                  bounds: { left: -32000, top: -32000, width: 1280, height: 850, windowState: 'normal' }
                                 }).catch(() => {});
                               }
                             } catch (_) {}
                             if (session.process?.pid) {
+                              startBackgroundWindowKeeper(session.process.pid);
                               setProcessTaskbarVisibility(session.process.pid, false);
                               await returnChromeToBackground(session.process.pid);
                             }
@@ -5083,26 +5407,32 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                         // ── DETECÇÃO PRIORITÁRIA: Modal "Verifica que és mesmo tu" / Palavra-passe / Código ──
                         const verifyAction = await handleTikTokVerificationModal();
                         if (verifyAction === 'clicked_option') {
+                          sec = 0;
                           await new Promise(r => setTimeout(r, 1000));
                           continue;
                         } else if (verifyAction === 'typed_password') {
+                          sec = 0;
                           setBadge('Palavra-passe enviada! Aguardando confirmação do TikTok...', '#22c55e');
                           await new Promise(r => setTimeout(r, 2000));
                           continue;
                         } else if (verifyAction === 'typed_code') {
+                          sec = 0;
                           setBadge('Código de verificação enviado! Aguardando confirmação do TikTok...', '#22c55e');
                           await new Promise(r => setTimeout(r, 3000));
                           continue;
                         } else if (verifyAction === 'waiting_code') {
+                          sec = 0; // 🛑 Requisito: Espera infinita enquanto aguarda código do ADM (sem timeout)
                           await new Promise(r => setTimeout(r, 1500));
                           continue;
                         } else if (verifyAction === 'waiting_manual') {
+                          sec = 0;
                           await new Promise(r => setTimeout(r, 2000));
                           continue;
                         }
 
                         // ── MODO PASSIVO: popup do Google ativo — ZERO interação na aba do TikTok ──
                         if (loginFlowStarted && !googleLoginDone) {
+                          sec = 0; // 🛑 Requisito: Espera infinita enquanto autoriza popup Google
                           setBadge('Aguardando autorização no popup Google...', '#f59e0b');
                           await new Promise(r => setTimeout(r, 1500));
                           continue;
@@ -5347,6 +5677,29 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                     const runInstagramLoginAutomation = async () => {
                       console.log(`[INSTAGRAM-LOGIN] Iniciando automação suave e humana para o perfil ${profileId}...`);
                       setBadge('Aguardando carregamento do Instagram...', '#38bdf8');
+
+                      // ── Garantir foco emulado e janela oculta para execução 100% em segundo plano ──
+                      await cdpSend(ws, 'Page.enable').catch(() => {});
+                      await cdpSend(ws, 'Runtime.enable').catch(() => {});
+                      await cdpSend(ws, 'DOM.enable').catch(() => {});
+                      await cdpSend(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+
+                      if (runInBackground) {
+                        try {
+                          const winTarget: any = await cdpSend(ws, 'Browser.getWindowForTarget', {}).catch(() => null);
+                          if (winTarget?.windowId != null) {
+                            await cdpSend(ws, 'Browser.setWindowBounds', {
+                              windowId: winTarget.windowId,
+                              bounds: { left: -32000, top: -32000, width: 1200, height: 810, windowState: 'normal' }
+                            }).catch(() => {});
+                          }
+                        } catch (_) {}
+                        if (session.process?.pid) {
+                          startBackgroundWindowKeeper(session.process.pid);
+                          setProcessTaskbarVisibility(session.process.pid, false);
+                        }
+                      }
+
                       await new Promise(r => setTimeout(r, 6000));
 
                       let hasFilledCredentials = false;
@@ -5536,6 +5889,17 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             await typeHuman(effUser);
                             await new Promise(r => setTimeout(r, 600));
 
+                            // Garantir preenchimento seguro de usuário mesmo em segundo plano
+                            await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[name="username"], input[name="emailOrPhone"], input[aria-label*="utilizador" i], input[aria-label*="username" i], input[type="text"]:not([aria-label*="pesquisa" i])');
+                                if (el && (!el.value || el.value !== ${JSON.stringify(effUser)})) {
+                                  el.focus();
+                                  document.execCommand('insertText', false, ${JSON.stringify(effUser)});
+                                }
+                              })()`
+                            }).catch(() => {});
+
                             // Focar e digitar Senha
                             setBadge('Inserindo senha do Instagram...', '#38bdf8');
                             await realClickAt(formInfo.pass.x, formInfo.pass.y);
@@ -5549,6 +5913,17 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             const effPass = pass || '';
                             await typeHuman(effPass);
                             await new Promise(r => setTimeout(r, 800));
+
+                            // Garantir preenchimento seguro de senha mesmo em segundo plano
+                            await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[name="password"], input[type="password"]');
+                                if (el && (!el.value || el.value !== ${JSON.stringify(effPass)})) {
+                                  el.focus();
+                                  document.execCommand('insertText', false, ${JSON.stringify(effPass)});
+                                }
+                              })()`
+                            }).catch(() => {});
 
                             hasFilledCredentials = true;
 
@@ -5652,7 +6027,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                     let fbCloseTimeout: NodeJS.Timeout | null = null;
                     let lastFb2FARequestTime = 0;
 
-                    const handleFacebookLoginSuccess = () => {
+                    const handleFacebookLoginSuccess = async () => {
                       if (fbLoginDetected) return;
                       fbLoginDetected = true;
                       if (fbCheckInterval) {
@@ -5671,9 +6046,14 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                       } catch (errFlag) {
                         console.error('[FACEBOOK] Erro ao gravar fb_authenticated.flag:', errFlag);
                       }
-                      saveFacebookCookies(ws, profileDir).catch((e) => {
-                        console.warn('[FACEBOOK] Erro ao salvar cookies em background:', e);
-                      });
+
+                      // Aguardar salvamento completo de cookies antes de agendar o fechamento
+                      try {
+                        await saveFacebookCookies(ws, profileDir);
+                        console.log('[FACEBOOK] Cookies persistidos com sucesso após confirmação de login.');
+                      } catch (e) {
+                        console.warn('[FACEBOOK] Erro ao salvar cookies após login:', e);
+                      }
 
                       event.sender.send('chrome-auth-status', { profileId, isLoggedIn: true });
                       mainWindow?.webContents.send('chrome-auth-status', { profileId, isLoggedIn: true });
@@ -5704,6 +6084,29 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                     const runFacebookLoginAutomation = async () => {
                       console.log(`[FACEBOOK-LOGIN] Iniciando automação unificada e inteligente para o parceiro ${partnerId || 'common'}...`);
                       setBadge('Aguardando carregamento do Facebook...', '#38bdf8');
+
+                      // ── Garantir foco emulado e janela oculta para execução 100% em segundo plano ──
+                      await cdpSend(ws, 'Page.enable').catch(() => {});
+                      await cdpSend(ws, 'Runtime.enable').catch(() => {});
+                      await cdpSend(ws, 'DOM.enable').catch(() => {});
+                      await cdpSend(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+
+                      if (runInBackground) {
+                        try {
+                          const winTarget: any = await cdpSend(ws, 'Browser.getWindowForTarget', {}).catch(() => null);
+                          if (winTarget?.windowId != null) {
+                            await cdpSend(ws, 'Browser.setWindowBounds', {
+                              windowId: winTarget.windowId,
+                              bounds: { left: -32000, top: -32000, width: 1200, height: 810, windowState: 'normal' }
+                            }).catch(() => {});
+                          }
+                        } catch (_) {}
+                        if (session.process?.pid) {
+                          startBackgroundWindowKeeper(session.process.pid);
+                          setProcessTaskbarVisibility(session.process.pid, false);
+                        }
+                      }
+
                       await new Promise(r => setTimeout(r, 6000));
 
                       let submitAttempted = false;
@@ -5923,6 +6326,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                         const cpVal = cpActionRes?.result?.value;
                         console.log(`[FACEBOOK-LOOP] cpVal.action=${cpVal?.action} (sec=${sec})`);
                         if (cpVal?.action === 'try_another_way') {
+                          sec = 0;
                           console.log('[FACEBOOK-2FA] "Try another way" localizado! Clicando via CDP...');
                           setBadge('Clicando em "Try another way"...', '#38bdf8');
                           if (cpVal.coords && typeof cpVal.coords.x === 'number') {
@@ -5935,6 +6339,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                         }
 
                         if (cpVal?.action === 'choose_email') {
+                          sec = 0;
                           console.log('[FACEBOOK-2FA] Tela de opções: Selecionando Email e clicando Continue...');
                           setBadge('A selecionar verificação por e-mail...', '#38bdf8');
                           if (cpVal.emailCoords) {
@@ -5951,13 +6356,13 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                         }
 
                         if (cpVal?.action === 'enter_code') {
+                          sec = 0; // 🛑 Requisito: Espera infinita enquanto aguarda código do ADM (sem timeout)
                           console.log('[FACEBOOK-2FA] Tela de código OTP ativa.');
                           setBadge('🔑 Aguardando código do Administrador no painel...', '#f59e0b');
                           const nowTs = Date.now();
                           if (nowTs - lastFb2FARequestTime > 120000) {
                             lastFb2FARequestTime = nowTs;
-                            event.sender.send('chrome-request-2fa', { profileId, partnerId, platform: 'facebook' });
-                            mainWindow?.webContents.send('chrome-request-2fa', { profileId, partnerId, platform: 'facebook' });
+                            dispatch2FARequest({ profileId, partnerId, platform: 'facebook', codeType: 'facebook_totp', accountId: session.accountId, email: session.email }, event.sender);
                           }
                           const incomingCode = (session.lastCode || '').trim();
                           if (incomingCode && incomingCode.length >= 4) {
@@ -5984,6 +6389,75 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 13, key: 'Enter', code: 'Enter' }).catch(() => {});
                             await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp',   windowsVirtualKeyCode: 13, key: 'Enter', code: 'Enter' }).catch(() => {});
                             await new Promise(r => setTimeout(r, 4000));
+
+                            // 🔍 Requisito: Verificar se o Facebook acusou código 2FA incorreto ou expirado
+                            const checkFbCodeError: any = await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                try {
+                                  var fbErrorPhrases = [
+                                    'código que você inseriu está incorreto',
+                                    'código que inseriu está incorreto',
+                                    'o código inserido está incorreto',
+                                    'o código que introduziu é inválido',
+                                    'o código que introduziu está incorreto',
+                                    'the code you entered is incorrect',
+                                    'invalid verification code',
+                                    'código de verificação inválido',
+                                    'código 2fa incorreto',
+                                    'código inválido',
+                                    'código incorreto'
+                                  ];
+
+                                  var isFbError = false;
+                                  var fbErrMsg = '';
+                                  var allText = (document.body ? (document.body.innerText || '') : '').toLowerCase();
+                                  for (var f = 0; f < fbErrorPhrases.length; f++) {
+                                    if (allText.includes(fbErrorPhrases[f])) {
+                                      isFbError = true;
+                                      fbErrMsg = fbErrorPhrases[f];
+                                      break;
+                                    }
+                                  }
+
+                                  var alertEl = document.querySelector('[role="alert"], .uiError');
+                                  if (alertEl) {
+                                    var alertTxt = (alertEl.innerText || '').toLowerCase();
+                                    for (var f = 0; f < fbErrorPhrases.length; f++) {
+                                      if (alertTxt.includes(fbErrorPhrases[f])) {
+                                        isFbError = true;
+                                        fbErrMsg = alertEl.innerText;
+                                        break;
+                                      }
+                                    }
+                                  }
+
+                                  var inputStillPresent = !!document.querySelector('input[name="approvals_code"], input[name="verification_code"], input[id*="checkpoint" i], input[type="text"], input[inputmode="numeric"]');
+                                  if (isFbError && inputStillPresent) {
+                                    return { isError: true, message: fbErrMsg || 'Código 2FA incorreto ou expirado no Facebook' };
+                                  }
+                                  return { isError: false };
+                                } catch(e) { return { isError: false }; }
+                              })()`,
+                              returnByValue: true
+                            }).catch(() => null);
+
+                            if (checkFbCodeError?.result?.value?.isError) {
+                              const errMsg = checkFbCodeError.result.value.message || 'Código 2FA incorreto ou expirado no Facebook';
+                              console.warn(`[FACEBOOK-2FA] ❌ Código incorreto detectado: "${errMsg}". Re-notificando ADM imediatamente...`);
+                              setBadge('⚠️ Código 2FA incorreto! Solicitando novo código ao ADM...', '#ef4444');
+                              session.lastCode = '';
+                              if (cpVal.inputCoords) {
+                                await realClickAt(cpVal.inputCoords.x, cpVal.inputCoords.y);
+                                await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 65, key: 'a', code: 'KeyA', modifiers: 2 }).catch(() => {});
+                                await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp',   windowsVirtualKeyCode: 65, key: 'a', code: 'KeyA' }).catch(() => {});
+                                await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 8,  key: 'Backspace', code: 'Backspace' }).catch(() => {});
+                                await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp',   windowsVirtualKeyCode: 8,  key: 'Backspace', code: 'Backspace' }).catch(() => {});
+                              }
+                              lastFb2FARequestTime = 0; // Resetar throttle
+                              dispatch2FARequest({ profileId, partnerId, platform: 'facebook', codeType: 'facebook_totp', isRetry: true, errorMessage: errMsg, accountId: session.accountId, email: session.email }, event.sender);
+                              continue;
+                            }
+
                             continue;
                           }
                           await new Promise(r => setTimeout(r, 2000));
@@ -6066,6 +6540,17 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             await typeHuman(effUser);
                             await new Promise(r => setTimeout(r, 400));
 
+                            // Garantir preenchimento seguro de usuário mesmo em segundo plano
+                            await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input#email, input[name="email"]') || document.querySelector('input[type="text"]:not([aria-label*="pesquisa" i]):not([aria-label*="search" i])');
+                                if (el) {
+                                  el.focus();
+                                  document.execCommand('insertText', false, ${JSON.stringify(effUser)});
+                                }
+                              })()`
+                            }).catch(() => {});
+
                             // Sincronizar React Tracker
                             await cdpSend(ws, 'Runtime.evaluate', {
                               expression: `(function() {
@@ -6096,6 +6581,17 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                             await typeHuman(effPass);
                             await new Promise(r => setTimeout(r, 500));
+
+                            // Garantir preenchimento seguro de senha mesmo em segundo plano
+                            await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input#pass, input[name="pass"], input[type="password"]');
+                                if (el) {
+                                  el.focus();
+                                  document.execCommand('insertText', false, ${JSON.stringify(effPass)});
+                                }
+                              })()`
+                            }).catch(() => {});
 
                             // Sincronizar React Tracker da Senha
                             await cdpSend(ws, 'Runtime.evaluate', {
@@ -6309,6 +6805,26 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                     const runYouTubeLoginAutomation = async () => {
                       console.log(`[YOUTUBE-LOGIN] Iniciando automação Google/YouTube para ${partnerId || profileId}...`);
                       setBadge('Aguardando carregamento do Google...', '#38bdf8');
+
+                      // ── Garantir foco emulado para que CDP Input funcione 100% em segundo plano ──
+                      await cdpSend(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+                      await cdpSend(ws, 'DOM.enable').catch(() => {});
+
+                      // Forçar janela offscreen e ocultar da barra de tarefas imediatamente
+                      try {
+                        const winTarget: any = await cdpSend(ws, 'Browser.getWindowForTarget', {}).catch(() => null);
+                        if (winTarget?.windowId != null) {
+                          await cdpSend(ws, 'Browser.setWindowBounds', {
+                            windowId: winTarget.windowId,
+                            bounds: { left: -32000, top: -32000, width: 1200, height: 810, windowState: 'normal' }
+                          }).catch(() => {});
+                        }
+                      } catch (_) {}
+                      if (session.process?.pid) {
+                        startBackgroundWindowKeeper(session.process.pid);
+                        setProcessTaskbarVisibility(session.process.pid, false);
+                      }
+
                       // Aguardo reativo inicial (máx 3s)
                       for (let gw = 0; gw < 15; gw++) {
                         await new Promise(r => setTimeout(r, 200));
@@ -6646,6 +7162,14 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           setBadge('Preenchendo e-mail protegido...', '#38bdf8');
 
                           if (pa.inputCoords) {
+                            // Assegurar foco no elemento
+                            await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[type="email"], #identifierId, input[name="identifier"], input[autocomplete="username"]');
+                                if (el) { el.focus(); }
+                              })()`
+                            }).catch(() => {});
+
                             await realClickAt(pa.inputCoords.x, pa.inputCoords.y);
                             await new Promise(r => setTimeout(r, 400));
 
@@ -6656,7 +7180,23 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 8, key: 'Backspace', code: 'Backspace' }).catch(() => {});
 
                             await typeHuman(effUser);
-                            await new Promise(r => setTimeout(r, 500));
+                            await new Promise(r => setTimeout(r, 400));
+
+                            // Garantir preenchimento seguro mesmo em segundo plano
+                            await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[type="email"], #identifierId, input[name="identifier"], input[autocomplete="username"]');
+                                if (el && (!el.value || el.value.trim().length === 0)) {
+                                  el.focus();
+                                  document.execCommand('insertText', false, ${JSON.stringify(effUser)});
+                                  if (!el.value) {
+                                    el.value = ${JSON.stringify(effUser)};
+                                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                                  }
+                                }
+                              })()`
+                            }).catch(() => {});
                           }
 
                           if (pa.btnCoords) {
@@ -6688,6 +7228,14 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           setBadge('Preenchendo senha protegida...', '#38bdf8');
 
                           if (pa.inputCoords) {
+                            // Assegurar foco no elemento
+                            await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[type="password"], input[name="Passwd"], input[name="password"], input[autocomplete="current-password"]');
+                                if (el) { el.focus(); }
+                              })()`
+                            }).catch(() => {});
+
                             await realClickAt(pa.inputCoords.x, pa.inputCoords.y);
                             await new Promise(r => setTimeout(r, 400));
 
@@ -6697,7 +7245,23 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 8, key: 'Backspace', code: 'Backspace' }).catch(() => {});
 
                             await typeHuman(effPass);
-                            await new Promise(r => setTimeout(r, 500));
+                            await new Promise(r => setTimeout(r, 400));
+
+                            // Garantir preenchimento seguro mesmo em segundo plano
+                            await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[type="password"], input[name="Passwd"], input[name="password"], input[autocomplete="current-password"]');
+                                if (el && (!el.value || el.value.trim().length === 0)) {
+                                  el.focus();
+                                  document.execCommand('insertText', false, ${JSON.stringify(effPass)});
+                                  if (!el.value) {
+                                    el.value = ${JSON.stringify(effPass)};
+                                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                                  }
+                                }
+                              })()`
+                            }).catch(() => {});
                           }
 
                           if (pa.btnCoords) {
@@ -6708,7 +7272,25 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           }
                           passSubmitted = true;
                           console.log('[YOUTUBE-LOGIN] Senha submetida! Aguardando autenticação Google...');
-                          setBadge('Autenticando no Google...', '#38bdf8');
+                          setBadge('Autenticando no Google em segundo plano...', '#38bdf8');
+
+                          // 🚀 Requisito: Mover Chrome Real imediatamente para segundo plano após a senha
+                          try {
+                            const winTarget: any = await cdpSend(ws, 'Browser.getWindowForTarget', {}).catch(() => null);
+                            if (winTarget?.windowId != null) {
+                              await cdpSend(ws, 'Browser.setWindowBounds', {
+                                windowId: winTarget.windowId,
+                                bounds: { left: -32000, top: -32000, width: 1200, height: 810, windowState: 'normal' }
+                              }).catch(() => {});
+                            }
+                            if (mainWindow && !mainWindow.isDestroyed()) {
+                              mainWindow.focus();
+                            }
+                            console.log('[YOUTUBE-LOGIN] 🚀 Senha submetida! Janela mantida em segundo plano (-32000, -32000).');
+                          } catch (bgErr) {
+                            console.warn('[YOUTUBE-LOGIN] Aviso ao mover para segundo plano pós-senha:', bgErr);
+                          }
+
                           for (let pw = 0; pw < 20; pw++) {
                             await new Promise(r => setTimeout(r, 200));
                             const curUrlRes: any = await cdpSend(ws, 'Runtime.evaluate', { expression: 'window.location.href', returnByValue: true }).catch(() => null);
@@ -6717,6 +7299,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           }
                           continue;
                         }
+
 
                         // E. Consentimento / Not Now / Continuar
                         if (pa?.action === 'consent_click' && pa.coords) {
@@ -6802,14 +7385,14 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           continue;
                         }
 
-                        // F. 2FA
+                        // F. 2FA (Google TOTP / SMS / Backup Code)
                         if (pa?.action === 'google_2fa') {
-                          setBadge('🔑 Aguardando código 2FA...', '#f59e0b');
+                          sec = 0; // 🛑 Requisito: Espera infinita enquanto aguarda código do ADM (sem timeout)
+                          setBadge('🔑 Aguardando código 2FA do Administrador...', '#f59e0b');
                           const nowTs = Date.now();
-                          if (nowTs - lastNotifTime > 120000) {
+                          if (nowTs - lastNotifTime > 60000) {
                             lastNotifTime = nowTs;
-                            event.sender.send('chrome-request-2fa', { profileId, partnerId, platform: 'youtube' });
-                            mainWindow?.webContents.send('chrome-request-2fa', { profileId, partnerId, platform: 'youtube' });
+                            dispatch2FARequest({ profileId, partnerId, platform: 'youtube', codeType: 'google_totp', accountId: session.accountId, email: googleEmail || session.email }, event.sender);
                           }
                           const incomingCode = (session.lastCode || '').trim();
                           if (incomingCode && incomingCode.length >= 4) {
@@ -6830,11 +7413,85 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                               await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, key: 'Enter', code: 'Enter' }).catch(() => {});
                             }
                             await new Promise(r => setTimeout(r, 4000));
+
+                            // 🔍 Requisito: Verificar se o Google acusou código 2FA incorreto ou expirado
+                            const checkGoogleCodeError: any = await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                try {
+                                  var errorPhrases = [
+                                    'código incorreto',
+                                    'código de verificação incorreto',
+                                    'código errado',
+                                    'wrong code',
+                                    'incorrect code',
+                                    'não foi possível verificar seu código',
+                                    "couldn't verify your code",
+                                    'muitas tentativas',
+                                    'too many attempts',
+                                    'código expirado',
+                                    'code expired'
+                                  ];
+                                  var isCodeError = false;
+                                  var errMsg = '';
+
+                                  var explicitErrorEl = document.querySelector('#error, .o6cuMc, [jsname="B34EJ"]');
+                                  var liveEl = document.querySelector('[aria-live="assertive"]');
+                                  var checkTxt = ((explicitErrorEl ? (explicitErrorEl.innerText || '') : '') + ' ' + (liveEl ? (liveEl.innerText || '') : '')).toLowerCase();
+
+                                  for (var ep = 0; ep < errorPhrases.length; ep++) {
+                                    if (checkTxt.includes(errorPhrases[ep])) {
+                                      isCodeError = true;
+                                      errMsg = errorPhrases[ep];
+                                      break;
+                                    }
+                                  }
+
+                                  if (!isCodeError) {
+                                    var allText = (document.body ? (document.body.innerText || '') : '').toLowerCase();
+                                    for (var ep = 0; ep < errorPhrases.length; ep++) {
+                                      if (allText.includes(errorPhrases[ep])) {
+                                        isCodeError = true;
+                                        errMsg = errorPhrases[ep];
+                                        break;
+                                      }
+                                    }
+                                  }
+
+                                  var hasInputStillVisible = !!document.querySelector('input[type="tel"], input[name*="code" i], #idvPin, #totpPin, input[type="text"]');
+                                  if (isCodeError && hasInputStillVisible) {
+                                    return { isError: true, message: errMsg || 'Código 2FA incorreto ou expirado' };
+                                  }
+                                  return { isError: false };
+                                } catch(e) { return { isError: false }; }
+                              })()`,
+                              returnByValue: true
+                            }).catch(() => null);
+
+                            if (checkGoogleCodeError?.result?.value?.isError) {
+                              const errMsg = checkGoogleCodeError.result.value.message || 'Código 2FA incorreto ou expirado';
+                              console.warn(`[YOUTUBE-LOGIN] ❌ Código 2FA incorreto detectado: "${errMsg}". Re-notificando ADM imediatamente...`);
+                              setBadge('⚠️ Código 2FA incorreto! Solicitando novo código ao ADM...', '#ef4444');
+                              session.lastCode = '';
+                              // Limpar input de código no DOM
+                              if (pa.inputCoords) {
+                                await realClickAt(pa.inputCoords.x, pa.inputCoords.y);
+                                await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 65, key: 'a', code: 'KeyA', modifiers: 2 }).catch(() => {});
+                                await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 65, key: 'a', code: 'KeyA' }).catch(() => {});
+                                await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 8, key: 'Backspace', code: 'Backspace' }).catch(() => {});
+                                await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 8, key: 'Backspace', code: 'Backspace' }).catch(() => {});
+                              }
+                              // Re-notificar o ADM na hora com flag de re-tentativa
+                              lastNotifTime = Date.now();
+                              dispatch2FARequest({ profileId, partnerId, platform: 'youtube', codeType: 'google_totp', isRetry: true, errorMessage: errMsg, accountId: session.accountId, email: googleEmail || session.email }, event.sender);
+                              continue;
+                            }
+
                             continue;
                           }
                           await new Promise(r => setTimeout(r, 2000));
                           continue;
                         }
+
 
                         // Reiniciar se email voltou vazio após submit
                         if (emailSubmitted && pa?.action === 'email_field' && !(pa?.currentValue || '').includes((effUser || '').split('@')[0])) {
@@ -6868,52 +7525,49 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                       if (msg.method === 'Target.targetCreated') {
                         const targetInfo = msg.params?.targetInfo;
                         if (targetInfo && targetInfo.type === 'page' && targetInfo.targetId && targetInfo.targetId !== session.mainTargetId) {
-                          if (isInstagramLogin || isFacebookLogin) {
-                            return; // Login manual do Instagram/Facebook — parceiro pode precisar de abrir janelas
+                          if ((isInstagramLogin || isFacebookLogin) && !runInBackground) {
+                            return; // Login manual do Instagram/Facebook apenas quando em primeiro plano
                           }
-                          // TikTok login E YouTube login: permitir apenas popups Google OAuth legítimos
-                          // Fechar qualquer outra janela (ex: "Abrir janela do browser" no menu)
-                          if (isTikTokLogin || isYouTubeLogin) {
-                            const tUrl = (targetInfo.url || '').toLowerCase();
-                            const isGoogleOAuth =
-                              tUrl.includes('accounts.google.') ||
-                              tUrl.includes('google.com/o/oauth') ||
-                              tUrl.includes('tiktok.com') ||  // popup TikTok fase 2
-                              tUrl === 'about:blank' ||
-                              tUrl === '';
-                            if (!isGoogleOAuth) {
-                              console.log(`[SECURITY-LOGIN] Nova janela não autorizada durante login (${targetInfo.url || ''}) -> Fechando imediatamente`);
-                              cdpSend(ws, 'Target.closeTarget', { targetId: targetInfo.targetId }).catch(() => {});
-                            }
+                          // Em segundo plano (ou login TikTok/YouTube): fechar qualquer janela não autorizada (ex: "Abrir janela do browser" no menu)
+                          const tUrl = (targetInfo.url || '').toLowerCase();
+                          const isGoogleOAuth =
+                            tUrl.includes('accounts.google.') ||
+                            tUrl.includes('google.com/o/oauth') ||
+                            tUrl.includes('tiktok.com') ||  // popup TikTok fase 2
+                            tUrl === 'about:blank' ||
+                            tUrl === '';
+                          if (!isGoogleOAuth || (!isTikTokLogin && !isYouTubeLogin && runInBackground)) {
+                            console.log(`[SECURITY-LOGIN] Nova janela não autorizada (${targetInfo.url || ''}) -> Fechando imediatamente`);
+                            cdpSend(ws, 'Target.closeTarget', { targetId: targetInfo.targetId }).catch(() => {});
                             return;
                           }
-                          console.log(`[SECURITY] Janela externa popup detectada (${targetInfo.url || ''}) -> Fechando target ${targetInfo.targetId}`);
-                          cdpSend(ws, 'Target.closeTarget', { targetId: targetInfo.targetId }).catch(() => {});
+                          // Se for popup Google legítimo em segundo plano: manter fora da tela e iniciar guardião
+                          if (runInBackground && session.process?.pid) {
+                            startBackgroundWindowKeeper(session.process.pid);
+                            setProcessTaskbarVisibility(session.process.pid, false);
+                          }
+                          return;
                         }
                       }
                       if (msg.method === 'Target.attachedToTarget') {
                         const targetInfo = msg.params?.targetInfo;
                         const childSessionId = msg.params?.sessionId;
                         if (targetInfo && targetInfo.type === 'page' && targetInfo.targetId && targetInfo.targetId !== session.mainTargetId) {
-                          if (isInstagramLogin || isFacebookLogin) {
-                            return; // Login manual do Instagram/Facebook
+                          if ((isInstagramLogin || isFacebookLogin) && !runInBackground) {
+                            return; // Login manual do Instagram/Facebook apenas quando em primeiro plano
                           }
-                          if (isTikTokLogin || isYouTubeLogin) {
-                            const tUrl = (targetInfo.url || '').toLowerCase();
-                            const isGoogleOAuth =
-                              tUrl.includes('accounts.google.') ||
-                              tUrl.includes('google.com/o/oauth') ||
-                              tUrl.includes('tiktok.com') ||
-                              tUrl === 'about:blank' ||
-                              tUrl === '';
-                            if (!isGoogleOAuth) {
-                              console.log(`[SECURITY-LOGIN] Target secundário não autorizado durante login -> Fechando ${targetInfo.targetId}`);
-                              cdpSend(ws, 'Target.closeTarget', { targetId: targetInfo.targetId }).catch(() => {});
-                            }
+                          const tUrl = (targetInfo.url || '').toLowerCase();
+                          const isGoogleOAuth =
+                            tUrl.includes('accounts.google.') ||
+                            tUrl.includes('google.com/o/oauth') ||
+                            tUrl.includes('tiktok.com') ||
+                            tUrl === 'about:blank' ||
+                            tUrl === '';
+                          if (!isGoogleOAuth || (!isTikTokLogin && !isYouTubeLogin && runInBackground)) {
+                            console.log(`[SECURITY-LOGIN] Target secundário não autorizado -> Fechando ${targetInfo.targetId}`);
+                            cdpSend(ws, 'Target.closeTarget', { targetId: targetInfo.targetId }).catch(() => {});
                             return;
                           }
-                          console.log(`[SECURITY] Target secundário anexado detectado -> Fechando ${targetInfo.targetId}`);
-                          cdpSend(ws, 'Target.closeTarget', { targetId: targetInfo.targetId }).catch(() => {});
                         }
                       }
 
@@ -6941,16 +7595,30 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           const now = Date.now();
                           if (now - last2FARequestTime > 5000) {
                             last2FARequestTime = now;
-                            event.sender.send('chrome-request-2fa', { profileId });
+                            const evtPayload = {
+                              profileId,
+                              partnerId: session.partnerId,
+                              platform: session.platform,
+                              accountId: session.accountId,
+                              email: session.googleEmail || session.email,
+                              codeType: session.platform === 'tiktok' ? 'email_code' : session.platform === 'facebook' ? 'facebook_totp' : 'google_totp',
+                            };
+                            dispatch2FARequest(evtPayload, event.sender);
                           }
                         } else if (strVal.includes('[AGENT_AUTH_STATUS]:true')) {
                           session.isLoggedIn = true;
-                          event.sender.send('chrome-auth-status', { profileId, isLoggedIn: true });
-                          mainWindow?.webContents.send('chrome-auth-status', { profileId, isLoggedIn: true });
+                          if (mainWindow && !mainWindow.isDestroyed()) {
+                            mainWindow.webContents.send('chrome-auth-status', { profileId, isLoggedIn: true });
+                          } else if (event.sender && !event.sender.isDestroyed()) {
+                            event.sender.send('chrome-auth-status', { profileId, isLoggedIn: true });
+                          }
                         } else if (strVal.includes('[AGENT_AUTH_STATUS]:false')) {
                           session.isLoggedIn = false;
-                          event.sender.send('chrome-auth-status', { profileId, isLoggedIn: false });
-                          mainWindow?.webContents.send('chrome-auth-status', { profileId, isLoggedIn: false });
+                          if (mainWindow && !mainWindow.isDestroyed()) {
+                            mainWindow.webContents.send('chrome-auth-status', { profileId, isLoggedIn: false });
+                          } else if (event.sender && !event.sender.isDestroyed()) {
+                            event.sender.send('chrome-auth-status', { profileId, isLoggedIn: false });
+                          }
                         } else if (strVal.includes('[TIKTOK_RESET_SESSION]')) {
                           console.log('[TIKTOK] Limpeza manual de cookies e recarregamento solicitado via painel');
                           cdpSend(ws, 'Network.clearBrowserCookies').catch(() => {});
@@ -8007,7 +8675,15 @@ ipcMain.on(
 ipcMain.on(
   'chrome-inject-code',
   async (_event, { code, profileId }: { code: string; profileId?: string }) => {
-    const cleanCode = (code || '').trim();
+    let cleanCode = (code || '').replace(/[\u200B-\u200D\uFEFF\u00A0\u200E\u200F\u0000-\u001F]/g, '').trim();
+    if (cleanCode !== 'MOBILE_APPROVED') {
+      cleanCode = cleanCode.replace(/^[Gg]-/i, '').trim();
+      if (/^[0-9\s-]+$/.test(cleanCode)) {
+        cleanCode = cleanCode.replace(/[\s-]+/g, '');
+      } else {
+        cleanCode = cleanCode.replace(/\s+/g, '');
+      }
+    }
     if (!cleanCode) return;
 
     // 1. Obter sessão correspondente ou a sessão mais recente aberta
@@ -8086,14 +8762,23 @@ ipcMain.on(
         } catch(eAudio) {}
 
         function fireEvents(el) {
-          ['input','change','blur','keyup','keydown'].forEach(function(evt) {
-            try { el.dispatchEvent(new Event(evt, { bubbles: true, cancelable: true })); } catch(e) {}
+          ['focus','input','change','keydown','keyup','blur'].forEach(function(evt) {
+            try {
+              var eventObj;
+              if (evt.startsWith('key')) {
+                eventObj = new KeyboardEvent(evt, { bubbles: true, cancelable: true, key: '0' });
+              } else {
+                eventObj = new Event(evt, { bubbles: true, cancelable: true });
+              }
+              el.dispatchEvent(eventObj);
+            } catch(e) {}
           });
         }
 
         function setSingleVal(el, val) {
           if (!el) return false;
           try {
+            el.focus();
             var last = el.value;
             var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set ||
                          Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')?.set;
@@ -8104,30 +8789,49 @@ ipcMain.on(
           return true;
         }
 
-        // 3. Procurar campo único de código (6 dígitos)
+        // 3. Procurar campo único de código (6, 8 ou 10 dígitos)
         var singleSelectors = [
+          '#idvPin',
+          'input[name="idvPin"]',
+          'input[name="approvals_code"]',
+          'input[id="approvals_code"]',
+          'input[name="verification_code"]',
           'input[data-e2e="verify-input"]',
-          'input[name*="code" i]',
+          '#totpPin',
           'input[name="totpPin"]',
           'input[name="pin"]',
+          'input[name="Pin"]',
+          'input[name*="code" i]',
+          'input[id*="code" i]',
+          'input[id*="pin" i]',
+          'input[id*="checkpoint" i]',
+          'input[autocomplete="one-time-code"]',
           'input[placeholder*="code" i]',
           'input[placeholder*="código" i]',
-          'input[autocomplete="one-time-code"]',
+          'input[aria-label*="code" i]',
+          'input[aria-label*="código" i]',
           'input[maxlength="6"]',
-          'input[type="number"][maxlength="6"]',
-          'input[type="tel"][maxlength="6"]'
+          'input[maxlength="8"]',
+          'input[maxlength="10"]',
+          'input[type="tel"]',
+          'input[inputmode="numeric"]',
+          'input[type="number"]'
         ];
 
         var filled = false;
         for (var i = 0; i < singleSelectors.length; i++) {
           var el = document.querySelector(singleSelectors[i]);
-          if (el) { filled = setSingleVal(el, codeVal); break; }
+          if (el && (el.offsetParent !== null || el.getClientRects().length > 0)) {
+            filled = setSingleVal(el, codeVal);
+            break;
+          }
         }
 
         // 4. Se não encontrou campo único, procurar caixas de dígitos individuais (ex: 6 inputs maxlength=1)
         if (!filled) {
           var digitInputs = Array.from(document.querySelectorAll('input')).filter(function(inp) {
-            return inp.getAttribute('maxlength') === '1' || inp.getAttribute('data-e2e')?.indexOf('digit') > -1 || inp.className.indexOf('digit') > -1;
+            return (inp.getAttribute('maxlength') === '1' || inp.getAttribute('data-e2e')?.indexOf('digit') > -1 || inp.className.indexOf('digit') > -1) &&
+                   (inp.offsetParent !== null || inp.getClientRects().length > 0);
           });
 
           if (digitInputs.length >= codeVal.length) {
@@ -8143,9 +8847,11 @@ ipcMain.on(
           try {
             var buttons = Array.from(document.querySelectorAll('button, input[type="submit"], div[role="button"]'));
             var submitBtn = buttons.find(function(b) {
+              if (b.offsetParent === null && b.getClientRects().length === 0) return false;
               var txt = (b.textContent || b.value || '').toLowerCase().trim();
               return txt.indexOf('verificar') > -1 || txt.indexOf('confirm') > -1 || txt.indexOf('avançar') > -1 ||
-                     txt.indexOf('próximo') > -1 || txt.indexOf('verify') > -1 || txt.indexOf('next') > -1 || txt.indexOf('submit') > -1;
+                     txt.indexOf('próximo') > -1 || txt.indexOf('verify') > -1 || txt.indexOf('next') > -1 || txt.indexOf('submit') > -1 ||
+                     txt.indexOf('continuar') > -1 || txt.indexOf('enviar') > -1;
             });
             if (submitBtn && !submitBtn.hasAttribute('disabled')) {
               submitBtn.click();
@@ -8984,10 +9690,12 @@ function buildInstagramCreatorGuideScript(): string {
 async function launchChromeForAccount(
   accountCode: string,
   platform: 'tiktok' | 'youtube' | 'facebook' | 'instagram',
-  runInBackground: boolean = false,
+  runInBackground: boolean = true,
   partnerId?: string,
   pageUrl?: string
 ): Promise<ChromeSession | null> {
+  // Publicação automática é estritamente em segundo plano
+  runInBackground = true;
   // 1. Reutilizar sessão aberta existente se processo estiver vivo
   let existing = chromeSessions.get(accountCode);
   if (!existing && platform === 'facebook') {
@@ -9025,6 +9733,10 @@ async function launchChromeForAccount(
               });
             }
           } catch (_) {}
+          if (existing.process?.pid) {
+            startBackgroundWindowKeeper(existing.process.pid);
+            setProcessTaskbarVisibility(existing.process.pid, false);
+          }
         }
         return existing;
       }
@@ -9071,7 +9783,10 @@ async function launchChromeForAccount(
                   });
                 }
               } catch (_) {}
-              setProcessTaskbarVisibility(existing.process?.pid, false);
+              if (existing.process?.pid) {
+                startBackgroundWindowKeeper(existing.process.pid);
+                setProcessTaskbarVisibility(existing.process.pid, false);
+              }
             }
             console.log(`[CHROME AUTO-LAUNCH] Reconectado e blindado na sessão existente de ${accountCode}`);
             return existing;
@@ -9116,7 +9831,16 @@ async function launchChromeForAccount(
 
   let initialUrl = 'https://www.tiktok.com/tiktokstudio/upload?from=webapp&lang=pt&tab=video';
   if (platform === 'youtube')   initialUrl = 'https://studio.youtube.com';
-  if (platform === 'facebook')  initialUrl = (pageUrl && pageUrl.trim()) ? pageUrl.trim() : 'https://www.facebook.com/reels/create/';
+  if (platform === 'facebook') {
+    const fbSwitchedFlag = path.join(profileDir, 'fb_page_switched.flag');
+    const hasSwitched = fsSync.existsSync(fbSwitchedFlag);
+    const fbDomain = (pageUrl && pageUrl.includes('web.facebook.com')) ? 'web.facebook.com' : 'www.facebook.com';
+    if (hasSwitched) {
+      initialUrl = `https://${fbDomain}/reels/create/`;
+    } else {
+      initialUrl = (pageUrl && pageUrl.trim()) ? pageUrl.trim() : `https://${fbDomain}/reels/create/`;
+    }
+  }
   if (platform === 'instagram') initialUrl = 'https://www.instagram.com/';
 
   const chromePath = findChromePath();
@@ -9220,7 +9944,10 @@ async function launchChromeForAccount(
               });
             }
           } catch (_) {}
-          setProcessTaskbarVisibility(session.process?.pid, false);
+          if (session.process?.pid) {
+            startBackgroundWindowKeeper(session.process.pid);
+            setProcessTaskbarVisibility(session.process.pid, false);
+          }
         }
         console.log(`[CHROME AUTO-LAUNCH] CDP conectado e blindado com sucesso para ${accountCode}`);
         return session;
@@ -9320,7 +10047,7 @@ ipcMain.handle('auto-publish-video', async (event, {
       if ((!targetSession || !targetSession.ws || targetSession.ws.readyState !== WebSocket.OPEN) && effectiveAccountCode) {
         notify(plat, 'uploading', 20, `Iniciando sessão isolada do Chrome Real para @${effectiveAccountCode} (${plat.toUpperCase()})...`);
         try {
-          targetSession = await launchChromeForAccount(effectiveAccountCode, plat, Boolean(runInBackground), partnerId, pageUrl);
+          targetSession = await launchChromeForAccount(effectiveAccountCode, plat, true, partnerId, pageUrl);
         } catch (e: unknown) {
           console.error('[AUTO-LAUNCH CHROME ERROR]:', e);
         }
@@ -9340,6 +10067,21 @@ ipcMain.handle('auto-publish-video', async (event, {
         notify(plat, 'error', 0, `Nenhuma janela do Chrome Real conectada para ${plat.toUpperCase()}. Faça o login primeiro.`);
         results[plat] = { success: false, error: `Sessão do Chrome Real não disponível para ${plat.toUpperCase()}.` };
         continue;
+      }
+
+      // Blindagem estrita: assegurar que a janela esteja SEMPRE em segundo plano (-32000, -32000), sem possibilidade de foco, preview ou maximização
+      try {
+        const boundsRes = (await cdpSend(targetSession.ws, 'Browser.getWindowForTarget')) as { windowId?: number };
+        if (boundsRes?.windowId) {
+          await cdpSend(targetSession.ws, 'Browser.setWindowBounds', {
+            windowId: boundsRes.windowId,
+            bounds: { windowState: 'normal', left: -32000, top: -32000, width: 1200, height: 810 }
+          });
+        }
+      } catch (_) {}
+      if (targetSession.process?.pid) {
+        startBackgroundWindowKeeper(targetSession.process.pid);
+        setProcessTaskbarVisibility(targetSession.process.pid, false);
       }
 
       try {
@@ -9465,13 +10207,207 @@ ipcMain.handle('auto-publish-video', async (event, {
           });
           await injectSecurityShieldToSession(ws, { isSignup: false });
 
+          // ── Helper: Fechar automaticamente popups/notificações/banners do TikTok ──
+          // Lida com: avisos de conta nova, notificações de boas-vindas, modais de "primeiro upload",
+          // popups de permissão, banners de dica, toasts, diálogos de segurança e qualquer overlay
+          // que bloqueie a interface de upload.
+          const dismissTikTokUploadPopups = async (): Promise<void> => {
+            const script = `
+              (function() {
+                var dismissed = 0;
+
+                // ── 1. Textos de botão de fechar / dispensar genéricos ──
+                var dismissKeywords = [
+                  'fechar', 'close', 'dispensar', 'dismiss', 'got it', 'entendi', 'ok', 'okay',
+                  'continuar', 'continue', 'prosseguir', 'proceed', 'skip', 'ignorar', 'ignore',
+                  'not now', 'agora não', 'talvez mais tarde', 'maybe later', 'later', 'depois',
+                  'não, obrigado', 'no thanks', 'no, thanks', 'no thank you',
+                  'concluído', 'done', 'certo', 'percebido', 'understood',
+                  'allow', 'permitir', 'accept', 'aceitar',
+                  // Botões de fechar (x) sem texto visível são tratados por seletores abaixo
+                ];
+
+                // ── 2. Seletores de overlays/modais/banners do TikTok ──
+                var overlaySelectors = [
+                  // Modais genéricos
+                  '[role="dialog"]',
+                  '[role="alertdialog"]',
+                  'div[class*="modal"]',
+                  'div[class*="Modal"]',
+                  'div[class*="dialog"]',
+                  'div[class*="Dialog"]',
+                  'div[class*="popup"]',
+                  'div[class*="Popup"]',
+                  'div[class*="overlay"]',
+                  'div[class*="Overlay"]',
+                  // TikTok specifics
+                  'div[class*="tux-modal"]',
+                  'div[class*="TUXModal"]',
+                  'div[class*="onboarding"]',
+                  'div[class*="Onboarding"]',
+                  'div[class*="welcome"]',
+                  'div[class*="Welcome"]',
+                  'div[class*="guide"]',
+                  'div[class*="Guide"]',
+                  'div[class*="tip"]',
+                  'div[class*="Tip"]',
+                  'div[class*="tooltip"]',
+                  'div[class*="Tooltip"]',
+                  'div[class*="notice"]',
+                  'div[class*="Notice"]',
+                  'div[class*="announcement"]',
+                  'div[class*="Announcement"]',
+                  'div[class*="banner"]',
+                  'div[class*="Banner"]',
+                  'div[class*="notification"]',
+                  'div[class*="Notification"]',
+                  'div[class*="toast"]',
+                  'div[class*="Toast"]',
+                  'div[class*="alert"]',
+                  'div[class*="Alert"]',
+                  'div[class*="newbie"]',
+                  'div[class*="Newbie"]',
+                  'div[class*="first-time"]',
+                  'div[class*="FirstTime"]',
+                  'div[class*="first_time"]',
+                  'div[class*="interstitial"]',
+                  'div[class*="Interstitial"]',
+                  'div[class*="cookie"]',
+                  'div[class*="Cookie"]',
+                  'div[class*="privacy"]',
+                  'div[class*="Privacy"]',
+                  'div[class*="gdpr"]',
+                  'div[class*="GDPR"]',
+                  'div[class*="consent"]',
+                  'div[class*="Consent"]',
+                ];
+
+                // ── 3. Seletores de botões de fechar (ícone X) ──
+                var closeButtonSelectors = [
+                  'button[aria-label*="close" i]',
+                  'button[aria-label*="fechar" i]',
+                  'button[aria-label*="dismiss" i]',
+                  'button[aria-label*="dispensar" i]',
+                  '[data-e2e*="close"]',
+                  '[data-e2e*="dismiss"]',
+                  'button[class*="close"]',
+                  'button[class*="Close"]',
+                  'button[class*="dismiss"]',
+                  'div[class*="close-btn"]',
+                  'div[class*="closeBtn"]',
+                  'div[class*="close-button"]',
+                  'div[class*="closeButton"]',
+                  'span[class*="close"]',
+                  'i[class*="close"]',
+                  // TikTok-specific close buttons
+                  '.tux-modal-close',
+                  '[class*="TUXModal"] [class*="close"]',
+                  '[class*="modal-close"]',
+                  '[class*="modal_close"]',
+                ];
+
+                // ── Fase A: Clicar em botões X de fechar em overlays ──
+                for (var cs = 0; cs < closeButtonSelectors.length; cs++) {
+                  try {
+                    var closeBtns = document.querySelectorAll(closeButtonSelectors[cs]);
+                    for (var ci = 0; ci < closeBtns.length; ci++) {
+                      var cb = closeBtns[ci];
+                      if (!cb || !cb.offsetParent) continue; // skip hidden
+                      try { cb.click(); dismissed++; } catch(e) {}
+                    }
+                  } catch(e) {}
+                }
+
+                // ── Fase B: Varrer overlays e clicar em botões com palavras-chave de dispensar ──
+                for (var os = 0; os < overlaySelectors.length; os++) {
+                  try {
+                    var overlays = document.querySelectorAll(overlaySelectors[os]);
+                    for (var oi = 0; oi < overlays.length; oi++) {
+                      var overlay = overlays[oi];
+                      if (!overlay || !overlay.offsetParent) continue; // skip hidden
+
+                      // Buscar botões dentro deste overlay
+                      var btns = overlay.querySelectorAll('button, [role="button"], a[class*="btn"], div[class*="btn"]');
+                      for (var bi = 0; bi < btns.length; bi++) {
+                        var btn = btns[bi];
+                        var txt = (btn.innerText || btn.textContent || '').toLowerCase().trim();
+                        if (!txt) continue;
+
+                        var isConfirmPublish = (
+                          txt === 'publicar' || txt === 'publicar agora' ||
+                          txt === 'publicar mesmo assim' || txt === 'post' ||
+                          txt === 'post now' || txt === 'post anyway' ||
+                          txt === 'postar' || txt === 'postar agora'
+                        );
+                        if (isConfirmPublish) continue; // NUNCA clicar no botão de publicar real
+
+                        for (var ki = 0; ki < dismissKeywords.length; ki++) {
+                          if (txt === dismissKeywords[ki] || txt.startsWith(dismissKeywords[ki])) {
+                            try { btn.click(); dismissed++; break; } catch(e) {}
+                          }
+                        }
+                      }
+                    }
+                  } catch(e) {}
+                }
+
+                // ── Fase C: Overlays de cookie / LGPD / consentimento com botão "Aceitar tudo" ──
+                try {
+                  var cookieBtns = document.querySelectorAll('button, [role="button"]');
+                  for (var cki = 0; cki < cookieBtns.length; cki++) {
+                    var ck = cookieBtns[cki];
+                    if (!ck || !ck.offsetParent) continue;
+                    var ckTxt = (ck.innerText || ck.textContent || '').toLowerCase().trim();
+                    if (
+                      ckTxt === 'aceitar tudo' || ckTxt === 'accept all' ||
+                      ckTxt === 'aceitar todos' || ckTxt === 'acceptall' ||
+                      ckTxt === 'aceitar cookies' || ckTxt === 'accept cookies' ||
+                      ckTxt === 'concordar' || ckTxt === 'agree' ||
+                      ckTxt === 'concordar com todos' || ckTxt === 'agree to all'
+                    ) {
+                      try { ck.click(); dismissed++; } catch(e) {}
+                    }
+                  }
+                } catch(e) {}
+
+                // ── Fase D: Pressionar Escape para fechar qualquer overlay modal ──
+                try {
+                  var hasVisibleOverlay = false;
+                  for (var vs = 0; vs < overlaySelectors.length; vs++) {
+                    var visEls = document.querySelectorAll(overlaySelectors[vs]);
+                    for (var vi = 0; vi < visEls.length; vi++) {
+                      if (visEls[vi] && visEls[vi].offsetParent) { hasVisibleOverlay = true; break; }
+                    }
+                    if (hasVisibleOverlay) break;
+                  }
+                  if (hasVisibleOverlay) {
+                    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true }));
+                    document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true }));
+                  }
+                } catch(e) {}
+
+                return { dismissed: dismissed };
+              })()
+            `;
+            try {
+              const res = (await cdpSend(ws, 'Runtime.evaluate', { expression: script, returnByValue: true })) as { result?: { value?: { dismissed?: number } } };
+              const count = res?.result?.value?.dismissed ?? 0;
+              if (count > 0) {
+                console.log(`[TIKTOK UPLOAD] Popup/notificação dispensado(s): ${count}`);
+              }
+            } catch (_) {}
+          };
+
           // 1. Aguardar e localizar o seletor de arquivos (input[type="file"]) com polling
+          // Dispensar popups antes e durante a espera pelo file input
           notify(plat, 'uploading', 35, 'Localizando seletor de upload do TikTok...');
           await cdpSend(ws, 'DOM.enable');
           let fileInputNodeId = 0;
 
           for (let attempt = 0; attempt < 30; attempt++) {
             await new Promise((r) => setTimeout(r, 1200));
+            // Dispensar popups a cada ciclo enquanto aguarda o field input
+            await dismissTikTokUploadPopups();
             fileInputNodeId = await locateFileInputNodeId();
             if (fileInputNodeId) break;
           }
@@ -9481,6 +10417,7 @@ ipcMain.handle('auto-publish-video', async (event, {
           }
 
           // 2. Injetar o arquivo de vídeo e disparar eventos
+          await dismissTikTokUploadPopups(); // garantir tela limpa antes de injetar
           notify(plat, 'uploading', 50, 'Injetando arquivo de vídeo...');
           await cdpSend(ws, 'DOM.setFileInputFiles', {
             nodeId: fileInputNodeId,
@@ -9495,6 +10432,8 @@ ipcMain.handle('auto-publish-video', async (event, {
 
           for (let waitSec = 0; waitSec < 60; waitSec++) {
             await new Promise((r) => setTimeout(r, 1500));
+            // Dispensar popups durante o processamento do vídeo (especialmente em contas novas)
+            if (waitSec % 2 === 0) await dismissTikTokUploadPopups();
             try {
               const checkStateScript = `
                 (function() {
@@ -9531,49 +10470,56 @@ ipcMain.handle('auto-publish-video', async (event, {
             throw new Error('Tempo limite excedido aguardando o TikTok Studio processar o arquivo de vídeo.');
           }
 
-          // 4. Preenchimento de Legenda e Hashtags (digitação humanizada via CDP)
-          notify(plat, 'captioning', 80, 'Preenchendo legenda e hashtags (digitação humanizada)...');
-          // Passo 4a: Focar o editor e limpar conteúdo anterior via DOM
-          const focusTikTokEditor = `
+          // 4. Preenchimento de Legenda e Hashtags (compatível 100% com Draft.js e React do TikTok)
+          notify(plat, 'captioning', 80, 'Preenchendo legenda e hashtags...');
+          const setTikTokCaptionScript = `
             (function() {
-              var editor = document.querySelector('div[contenteditable=\"true\"], div[class*=\"editor\"], textarea[placeholder*=\"legenda\" i], textarea[placeholder*=\"caption\" i]');
-              if (!editor) return false;
+              var editor = document.querySelector(
+                'div.notranslate.public-DraftEditor-content, ' +
+                'div[data-contents="true"], ' +
+                'div[contenteditable="true"], ' +
+                'div[class*="editor"], ' +
+                'textarea[placeholder*="legenda" i], ' +
+                'textarea[placeholder*="caption" i]'
+              );
+              if (!editor) return { success: false, reason: 'editor_not_found' };
+
               editor.focus();
-              if (editor.isContentEditable) { editor.innerText = ''; }
-              else { editor.value = ''; }
+
+              if (editor.isContentEditable) {
+                try {
+                  var sel = window.getSelection();
+                  var range = document.createRange();
+                  range.selectNodeContents(editor);
+                  sel.removeAllRanges();
+                  sel.addRange(range);
+                  document.execCommand('delete', false, null);
+                  document.execCommand('insertText', false, ${JSON.stringify(fullText)});
+                } catch(e) {
+                  editor.innerText = ${JSON.stringify(fullText)};
+                }
+              } else {
+                editor.value = ${JSON.stringify(fullText)};
+              }
+
               editor.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-              return true;
+              editor.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+              return { success: true };
             })()
           `;
-          const tiktokEditorFocused = await cdpSend(ws, 'Runtime.evaluate', { expression: focusTikTokEditor, returnByValue: true }).catch(() => null) as any;
-          await new Promise((r) => setTimeout(r, 500));
-          // Passo 4b: Digitar a legenda caractere a caractere de forma humanizada (fallback: injeção direta)
-          try {
-            if (tiktokEditorFocused?.result?.value === true) {
-              await typeHumanCdp(fullText);
-            } else { throw new Error('editor-not-found'); }
-          } catch (_captionErrTk) {
-            // Fallback: injeção direta caso typeHumanCdp falhe ou editor não encontrado
-            const fillCaptionFallback = `
-              (function() {
-                var editor = document.querySelector('div[contenteditable="true"], div[class*="editor"], textarea[placeholder*="legenda" i], textarea[placeholder*="caption" i]');
-                if (editor) {
-                  editor.focus();
-                  if (editor.isContentEditable) { editor.innerText = ${JSON.stringify(fullText)}; }
-                  else { editor.value = ${JSON.stringify(fullText)}; }
-                  editor.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-                  editor.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-                  return true;
-                }
-                return false;
-              })()
-            `;
-            await cdpSend(ws, 'Runtime.evaluate', { expression: fillCaptionFallback });
+
+          const captionSetRes = (await cdpSend(ws, 'Runtime.evaluate', {
+            expression: setTikTokCaptionScript,
+            returnByValue: true,
+          }).catch(() => null)) as any;
+
+          if (!captionSetRes?.result?.value?.success) {
+            try { await typeHumanCdp(fullText); } catch (_) {}
           }
           await new Promise((r) => setTimeout(r, 1500));
 
-          // 5. Localizar e aguardar botão "Publicar agora" / "Publicar" ficar ativo e habilitado
-          notify(plat, 'publishing', 90, 'Aguardando botão "Publicar agora" ficar ativo no TikTok Studio...');
+          // 5. Localizar e aguardar botão "Publicar" ficar ativo e habilitado (até 120 tentativas = 180s)
+          notify(plat, 'publishing', 90, 'Aguardando verificação do vídeo e ativação do botão Publicar no TikTok...');
           let buttonInfo: {
             found: boolean;
             enabled: boolean;
@@ -9583,6 +10529,15 @@ ipcMain.handle('auto-publish-video', async (event, {
 
           const inspectButtonScript = `
             (function() {
+              // Rolar página e containers para o final garantindo visibilidade do botão
+              try {
+                window.scrollTo(0, document.body.scrollHeight || 999999);
+                var scrollables = document.querySelectorAll('div[class*="scroll"], div[class*="container"], div[class*="content"], main');
+                for (var s = 0; s < scrollables.length; s++) {
+                  try { scrollables[s].scrollTop = scrollables[s].scrollHeight; } catch(_) {}
+                }
+              } catch(_) {}
+
               function findTikTokPostButton(root) {
                 if (!root) return null;
                 var candidates = [];
@@ -9672,6 +10627,7 @@ ipcMain.handle('auto-publish-video', async (event, {
                     txt === 'post now' ||
                     txt === 'publicar vídeo' ||
                     txt === 'publicar video' ||
+                    txt === 'post video' ||
                     txt.startsWith('publicar') ||
                     txt.startsWith('postar') ||
                     txt.startsWith('post now') ||
@@ -9757,8 +10713,44 @@ ipcMain.handle('auto-publish-video', async (event, {
             })()
           `;
 
-          for (let bAttempt = 0; bAttempt < 60; bAttempt++) {
+          // Script para tratar modais de confirmação popup do TikTok (Direitos Autorais / Publicar mesmo assim / etc.)
+          const handleConfirmModalScript = `
+            (function() {
+              var modalBtns = document.querySelectorAll(
+                'div[role="dialog"] button, div[class*="modal"] button, ' +
+                'div[role="dialog"] [role="button"], div[class*="dialog"] button, ' +
+                'div[class*="dialog"] [role="button"], div[class*="popover"] button, ' +
+                'div[class*="popover"] [role="button"], .tux-modal button, ' +
+                '[class*="TUXModal"] button, [class*="TUXModal"] [role="button"]'
+              );
+              for (var i = 0; i < modalBtns.length; i++) {
+                var mb = modalBtns[i];
+                var txt = (mb.innerText || mb.textContent || '').toLowerCase().trim();
+                if (
+                  txt === 'publicar agora' ||
+                  txt === 'publicar mesmo assim' ||
+                  txt === 'continuar a publicar' ||
+                  txt === 'post anyway' ||
+                  txt === 'post now' ||
+                  txt === 'publicar' ||
+                  txt === 'confirmar'
+                ) {
+                  try {
+                    mb.click();
+                    return { clicked: true, text: txt };
+                  } catch(e) {}
+                }
+              }
+              return { clicked: false };
+            })()
+          `;
+
+          for (let bAttempt = 0; bAttempt < 120; bAttempt++) {
             await new Promise((r) => setTimeout(r, 1500));
+            // Dispensar popups que possam estar cobrindo o botão Publicar
+            await dismissTikTokUploadPopups();
+            try { await cdpSend(ws, 'Runtime.evaluate', { expression: handleConfirmModalScript, returnByValue: true }); } catch(_) {}
+
             const checkRes = (await cdpSend(ws, 'Runtime.evaluate', {
               expression: inspectButtonScript,
               returnByValue: true,
@@ -9776,7 +10768,7 @@ ipcMain.handle('auto-publish-video', async (event, {
           }
 
           if (!buttonInfo || !buttonInfo.enabled) {
-            throw new Error('O botão "Publicar agora" no TikTok Studio permaneceu desabilitado ou não foi localizado após 90 segundos.');
+            throw new Error('O botão "Publicar" no TikTok Studio permaneceu desabilitado após 180 segundos. Verifique se o arquivo atende às diretrizes.');
           }
 
           // Pausa humanizada de revisão antes de publicar (2-4 segundos simulando leitura humana)
@@ -9945,32 +10937,6 @@ ipcMain.handle('auto-publish-video', async (event, {
             }
           }
 
-          // Script para tratar modais de confirmação popup do TikTok (Direitos Autorais / Publicar mesmo assim / etc.)
-          const handleConfirmModalScript = `
-            (function() {
-              var modalBtns = document.querySelectorAll('div[role="dialog"] button, div[class*="modal"] button, div[role="dialog"] [role="button"], div[class*="dialog"] button, div[class*="dialog"] [role="button"], div[class*="popover"] button, div[class*="popover"] [role="button"], .tux-modal button, [class*="TUXModal"] button, [class*="TUXModal"] [role="button"]');
-              for (var i = 0; i < modalBtns.length; i++) {
-                var mb = modalBtns[i];
-                var txt = (mb.innerText || mb.textContent || '').toLowerCase().trim();
-                if (
-                  txt === 'publicar agora' ||
-                  txt === 'publicar mesmo assim' ||
-                  txt === 'continuar a publicar' ||
-                  txt === 'post anyway' ||
-                  txt === 'post now' ||
-                  txt === 'publicar' ||
-                  txt === 'confirmar'
-                ) {
-                  try {
-                    mb.click();
-                    return { clicked: true, text: txt };
-                  } catch(e) {}
-                }
-              }
-              return { clicked: false };
-            })()
-          `;
-
           // 7. Confirmação Estrita: Aguardar tela ou modal de sucesso real do TikTok
           notify(plat, 'publishing', 98, 'Aguardando confirmação definitiva da publicação no TikTok...');
           let publishConfirmed = false;
@@ -10032,47 +10998,115 @@ ipcMain.handle('auto-publish-video', async (event, {
 
         } else if (plat === 'youtube') {
           notify(plat, 'uploading', 30, 'Acessando YouTube Studio...');
-          await cdpSend(ws, 'Page.navigate', {
-            url: 'https://studio.youtube.com',
-          });
-          await injectSecurityShieldToSession(ws, { isSignup: false });
-          await new Promise((r) => setTimeout(r, 4000));
 
-          // 1. Abrir modal de upload no YouTube Studio
-          notify(plat, 'uploading', 40, 'Abrindo modal de envio do YouTube Studio...');
-          await cdpSend(ws, 'Runtime.evaluate', {
-            expression: `
+          // Helper: Descartar popups/avisos/diálogos do YouTube Studio
+          const dismissYouTubeStudioPopups = async (): Promise<void> => {
+            const dismissYtScript = `
               (function() {
-                var createBtn = document.querySelector('#create-icon, button#create-button, [aria-label*="Criar" i], [aria-label*="Create" i]');
-                if (createBtn) createBtn.click();
-              })()
-            `,
-          });
-          await new Promise((r) => setTimeout(r, 1500));
-
-          // Clicar em "Enviar vídeos" no menu suspenso
-          await cdpSend(ws, 'Runtime.evaluate', {
-            expression: `
-              (function() {
-                var items = document.querySelectorAll('ytcp-text-menu [role="menuitem"], tp-yt-paper-item, #text-item-0, [test-id="upload-action"]');
-                for (var i = 0; i < items.length; i++) {
-                  var t = (items[i].innerText || '').toLowerCase();
-                  if (t.includes('enviar') || t.includes('upload') || t.includes('vídeo')) {
-                    items[i].click();
-                    return true;
+                try {
+                  var popups = document.querySelectorAll(
+                    'ytcp-dialog #close-button, ' +
+                    'ytcp-confirmation-dialog #cancel-button, ' +
+                    'tp-yt-paper-dialog [aria-label*="Fechar" i], ' +
+                    'tp-yt-paper-dialog [aria-label*="Close" i], ' +
+                    '#dismiss-button, button#dismiss-button, ' +
+                    'tp-yt-paper-button[aria-label*="Entendi" i], ' +
+                    'tp-yt-paper-button[aria-label*="Got it" i]'
+                  );
+                  for (var i = 0; i < popups.length; i++) {
+                    var p = popups[i];
+                    if (p && p.offsetParent) {
+                      var inner = p.querySelector('button, [role="button"]') || p;
+                      inner.click();
+                      p.click();
+                    }
                   }
-                }
-                if (items.length > 0) { items[0].click(); return true; }
-                return false;
+                } catch(_) {}
               })()
-            `,
-          });
+            `;
+            try { await cdpSend(ws, 'Runtime.evaluate', { expression: dismissYtScript }); } catch(_) {}
+          };
+
+          // Navegar para o YouTube Studio se necessário
+          try {
+            await cdpSend(ws, 'Page.navigate', { url: 'https://studio.youtube.com' });
+          } catch (_) {}
+          await injectSecurityShieldToSession(ws, { isSignup: false });
+
+          // Aguardar a SPA do YouTube Studio inicializar
+          notify(plat, 'uploading', 35, 'Aguardando painel do YouTube Studio inicializar...');
+          for (let waitYt = 0; waitYt < 20; waitYt++) {
+            await new Promise((r) => setTimeout(r, 1000));
+            await dismissYouTubeStudioPopups();
+            const checkYtLoaded = `
+              (function() {
+                return !!(
+                  document.querySelector('#create-icon, button#create-button, [aria-label*="Criar" i], [aria-label*="Create" i], #upload-button, ytcp-uploads-dialog')
+                );
+              })()
+            `;
+            const ytlRes = (await cdpSend(ws, 'Runtime.evaluate', { expression: checkYtLoaded, returnByValue: true }).catch(() => null)) as any;
+            if (ytlRes?.result?.value) break;
+          }
+
+          // 1. Abrir modal de upload no YouTube Studio com polling ativo e múltiplos seletores
+          notify(plat, 'uploading', 42, 'Abrindo assistente de upload do YouTube Studio...');
+          for (let openAttempt = 0; openAttempt < 20; openAttempt++) {
+            const checkDialogScript = `
+              (function() {
+                var dlg = document.querySelector('ytcp-uploads-dialog, [role="dialog"][aria-label*="Carregar" i], [role="dialog"][aria-label*="Upload" i]');
+                var inp = document.querySelector('ytcp-uploads-dialog input[type="file"], input[type="file"]');
+                return !!(dlg || inp);
+              })()
+            `;
+            const dlgRes = (await cdpSend(ws, 'Runtime.evaluate', { expression: checkDialogScript, returnByValue: true }).catch(() => null)) as any;
+            if (dlgRes?.result?.value) break;
+
+            const triggerUploadScript = `
+              (function() {
+                // Opção A: Botão central no painel quando não há vídeos ou na tela inicial
+                var centerUpload = document.querySelector('#upload-button, ytcp-button#upload-button, button#upload-button, [aria-label*="Enviar vídeos" i], [aria-label*="Upload videos" i]');
+                if (centerUpload) {
+                  var cInner = centerUpload.querySelector('button, [role="button"]') || centerUpload;
+                  cInner.click();
+                  centerUpload.click();
+                  return 'center_clicked';
+                }
+
+                // Opção B: Botão "+ Criar" no topo
+                var createBtn = document.querySelector('#create-icon, button#create-button, ytcp-button#create-icon, [aria-label*="Criar" i], [aria-label*="Create" i]');
+                if (createBtn) {
+                  var crInner = createBtn.querySelector('button, [role="button"]') || createBtn;
+                  crInner.click();
+                  createBtn.click();
+
+                  setTimeout(function() {
+                    var items = document.querySelectorAll('ytcp-text-menu [role="menuitem"], tp-yt-paper-item, #text-item-0, [test-id="upload-action"]');
+                    for (var i = 0; i < items.length; i++) {
+                      var t = (items[i].innerText || '').toLowerCase();
+                      if (t.includes('enviar') || t.includes('upload') || t.includes('vídeo') || t.includes('video')) {
+                        items[i].click();
+                        return;
+                      }
+                    }
+                    if (items.length > 0) items[0].click();
+                  }, 400);
+
+                  return 'create_clicked';
+                }
+
+                return 'none_found';
+              })()
+            `;
+            await cdpSend(ws, 'Runtime.evaluate', { expression: triggerUploadScript }).catch(() => {});
+            await new Promise((r) => setTimeout(r, 1200));
+          }
 
           // 2. Localizar seletor de arquivos no YouTube Studio com polling
           notify(plat, 'uploading', 50, 'Localizando seletor de upload do YouTube...');
           await cdpSend(ws, 'DOM.enable');
           let ytFileNodeId = 0;
-          for (let attempt = 0; attempt < 30; attempt++) {
+          for (let attempt = 0; attempt < 35; attempt++) {
             await new Promise((r) => setTimeout(r, 1200));
             ytFileNodeId = await locateFileInputNodeId();
             if (ytFileNodeId) break;
@@ -10082,7 +11116,7 @@ ipcMain.handle('auto-publish-video', async (event, {
             throw new Error('Não foi possível localizar o campo de upload no YouTube Studio. Verifique se o canal está ativo e conectado.');
           }
 
-          // 3. Injetar arquivo no YouTube
+          // 3. Injetar arquivo no YouTube Shorts
           notify(plat, 'uploading', 60, 'Enviando arquivo de vídeo para o YouTube Shorts...');
           await cdpSend(ws, 'DOM.setFileInputFiles', {
             nodeId: ytFileNodeId,
@@ -10091,18 +11125,18 @@ ipcMain.handle('auto-publish-video', async (event, {
 
           await dispatchEventsOnAllInputs();
 
-          // 4. Aguardar campos de título e descrição montarem
+          // 4. Aguardar campos de título e descrição montarem no formulário do YouTube
           notify(plat, 'captioning', 75, 'Aguardando processamento e preenchendo detalhes...');
           let ytDetailsReady = false;
           for (let waitSec = 0; waitSec < 45; waitSec++) {
             await new Promise((r) => setTimeout(r, 1500));
             const checkForm = `
               (function() {
-                var titleBox = document.querySelector('#textbox[aria-label*="title" i], #title-textarea #textbox');
+                var titleBox = document.querySelector('#textbox[aria-label*="title" i], #title-textarea #textbox, ytcp-social-suggestions-textbox #textbox');
                 return !!titleBox;
               })()
             `;
-            const formRes = (await cdpSend(ws, 'Runtime.evaluate', { expression: checkForm, returnByValue: true })) as { result: { value: boolean } };
+            const formRes = (await cdpSend(ws, 'Runtime.evaluate', { expression: checkForm, returnByValue: true }).catch(() => null)) as any;
             if (formRes?.result?.value) {
               ytDetailsReady = true;
               break;
@@ -10113,70 +11147,94 @@ ipcMain.handle('auto-publish-video', async (event, {
             throw new Error('Tempo limite excedido aguardando o YouTube carregar os detalhes do vídeo.');
           }
 
-          // Preencher título, descrição e selecionar "Não é para crianças" (humanizado via CDP)
-          // Passo: Focar titleBox, limpar e digitar o título de forma humanizada
-          const focusYtTitle = `
+          // Garantir limite estrito de 100 caracteres no título do YouTube para nunca travar a validação
+          const rawTitle = title || caption || 'Shorts';
+          const ytTitleText = rawTitle.slice(0, 95).trim();
+
+          // Preencher Título de forma nativa e compatível com WebComponent Polymer
+          const fillYtTitleScript = `
             (function() {
-              var tb = document.querySelector('#textbox[aria-label*=\"title\" i], #title-textarea #textbox');
+              var tb = document.querySelector('#textbox[aria-label*="title" i], #title-textarea #textbox, ytcp-social-suggestions-textbox #textbox');
               if (!tb) return false;
-              tb.focus(); tb.innerText = '';
-              tb.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-              return true;
-            })()
-          `;
-          const ytTitleFocused = await cdpSend(ws, 'Runtime.evaluate', { expression: focusYtTitle, returnByValue: true }).catch(() => null) as any;
-          await new Promise((r) => setTimeout(r, 400));
-          const ytTitleText = title || caption.slice(0, 95);
-          if (ytTitleFocused?.result?.value === true) {
-            await typeHumanCdp(ytTitleText);
-          } else {
-            // fallback
-            await cdpSend(ws, 'Runtime.evaluate', {
-              expression: `(function(){ var tb = document.querySelector('#textbox[aria-label*="title" i], #title-textarea #textbox'); if(tb){ tb.innerText = ${JSON.stringify(ytTitleText)}; tb.dispatchEvent(new Event('input',{bubbles:true})); } })()`,
-              returnByValue: true
-            }).catch(() => null);
-          }
-          await new Promise((r) => setTimeout(r, 600));
-          // Passo: Focar descBox, limpar e digitar a descrição de forma humanizada
-          const focusYtDesc = `
-            (function() {
-              var db = document.querySelector('#description-textarea #textbox');
-              if (!db) return false;
-              db.focus(); db.innerText = '';
-              db.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-              return true;
-            })()
-          `;
-          const ytDescFocused = await cdpSend(ws, 'Runtime.evaluate', { expression: focusYtDesc, returnByValue: true }).catch(() => null) as any;
-          await new Promise((r) => setTimeout(r, 400));
-          if (ytDescFocused?.result?.value === true) {
-            await typeHumanCdp(fullText);
-          } else {
-            // fallback
-            await cdpSend(ws, 'Runtime.evaluate', {
-              expression: `(function(){ var db = document.querySelector('#description-textarea #textbox'); if(db){ db.innerText = ${JSON.stringify(fullText)}; db.dispatchEvent(new Event('input',{bubbles:true})); } })()`,
-              returnByValue: true
-            }).catch(() => null);
-          }
-          // Selecionar "Não é para crianças" (mantido sem alteração)
-          await cdpSend(ws, 'Runtime.evaluate', { expression: `
-            (function() {
-              var notKids = document.querySelector('tp-yt-paper-radio-button[name=\"VIDEO_MADE_FOR_KIDS_NOT_MFK\"], [name=\"VIDEO_MADE_FOR_KIDS_NOT_MFK\"]');
-              if (notKids) {
-                try { notKids.scrollIntoView({ block: 'center' }); } catch(_) {}
-                var rCont = notKids.querySelector('#radioContainer, [role=\"radio\"]') || notKids;
-                rCont.click(); notKids.click();
+              tb.focus();
+              try {
+                var sel = window.getSelection();
+                var range = document.createRange();
+                range.selectNodeContents(tb);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                document.execCommand('delete', false, null);
+                document.execCommand('insertText', false, ${JSON.stringify(ytTitleText)});
+              } catch(_) {
+                tb.innerText = ${JSON.stringify(ytTitleText)};
               }
+              tb.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+              tb.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
               return true;
             })()
-          ` }).catch(() => null);
+          `;
+          await cdpSend(ws, 'Runtime.evaluate', { expression: fillYtTitleScript }).catch(() => {});
+          await new Promise((r) => setTimeout(r, 800));
+
+          // Preencher Descrição de forma nativa
+          const fillYtDescScript = `
+            (function() {
+              var db = document.querySelector('#description-textarea #textbox, #textbox[aria-label*="description" i]');
+              if (!db) return false;
+              db.focus();
+              try {
+                var sel = window.getSelection();
+                var range = document.createRange();
+                range.selectNodeContents(db);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                document.execCommand('delete', false, null);
+                document.execCommand('insertText', false, ${JSON.stringify(fullText)});
+              } catch(_) {
+                db.innerText = ${JSON.stringify(fullText)};
+              }
+              db.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+              db.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+              return true;
+            })()
+          `;
+          await cdpSend(ws, 'Runtime.evaluate', { expression: fillYtDescScript }).catch(() => {});
+          await new Promise((r) => setTimeout(r, 800));
+
+          // Selecionar "Não é conteúdo para crianças" (obrigatório para liberar o botão Avançar)
+          const setYtNotKidsScript = `
+            (function() {
+              var notKids = document.querySelector(
+                'tp-yt-paper-radio-button[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], ' +
+                '[name="VIDEO_MADE_FOR_KIDS_NOT_MFK"], ' +
+                'tp-yt-paper-radio-button:has([name*="NOT_MFK"]), ' +
+                '#radioContainer:has([name*="NOT_MFK"])'
+              );
+              if (notKids) {
+                try { notKids.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch(_) {}
+                var rCont = notKids.querySelector('#radioContainer, [role="radio"]') || notKids;
+                rCont.click();
+                notKids.click();
+                try {
+                  notKids.checked = true;
+                  notKids.setAttribute('checked', '');
+                  notKids.dispatchEvent(new Event('change', { bubbles: true }));
+                  notKids.dispatchEvent(new CustomEvent('iron-change', { bubbles: true }));
+                } catch(_) {}
+                return true;
+              }
+              return false;
+            })()
+          `;
+          await cdpSend(ws, 'Runtime.evaluate', { expression: setYtNotKidsScript }).catch(() => {});
           await new Promise((r) => setTimeout(r, 1500));
 
-          // 5. Avançar pelos passos do assistente do YouTube até visibilidade de forma inteligente
+          // 5. Avançar pelas etapas do assistente do YouTube até a etapa de Visibilidade
           notify(plat, 'publishing', 85, 'Avançando etapas de publicação do YouTube...');
           let reachedVisibility = false;
-          for (let step = 0; step < 12; step++) {
-            const checkStepRes = (await cdpSend(ws, 'Runtime.evaluate', {
+
+          for (let stepAttempt = 0; stepAttempt < 35; stepAttempt++) {
+            const stepResult = (await cdpSend(ws, 'Runtime.evaluate', {
               expression: `
                 (function() {
                   var doneBtn = document.querySelector('#done-button, ytcp-button#done-button, button#done-button');
@@ -10189,18 +11247,26 @@ ipcMain.handle('auto-publish-video', async (event, {
 
                   var next = document.querySelector('#next-button, ytcp-button#next-button, button#next-button');
                   if (next) {
-                    var inner = next.querySelector('button, [role="button"]') || next;
-                    inner.click();
-                    next.click();
-                    return { isVisibility: false, clicked: true };
+                    var isDisabled = (
+                      next.disabled ||
+                      next.getAttribute('aria-disabled') === 'true' ||
+                      next.getAttribute('disabled') !== null
+                    );
+                    if (!isDisabled) {
+                      var inner = next.querySelector('button, [role="button"]') || next;
+                      inner.click();
+                      next.click();
+                      return { isVisibility: false, clicked: true };
+                    }
+                    return { isVisibility: false, waitingEnabled: true };
                   }
                   return { isVisibility: false, clicked: false };
                 })()
               `,
               returnByValue: true,
-            })) as { result: { value: { isVisibility: boolean; clicked: boolean } } };
+            })) as { result: { value: { isVisibility: boolean; clicked?: boolean; waitingEnabled?: boolean } } };
 
-            if (checkStepRes?.result?.value?.isVisibility) {
+            if (stepResult?.result?.value?.isVisibility) {
               reachedVisibility = true;
               console.log('[YOUTUBE AUTO] Etapa de Visibilidade alcançada com sucesso!');
               break;
@@ -10208,52 +11274,166 @@ ipcMain.handle('auto-publish-video', async (event, {
             await new Promise((r) => setTimeout(r, 1500));
           }
 
-          // 6. Selecionar "Público" na etapa de Visibilidade com garantia DOM e física CDP
+          // 6. Selecionar "Público" na etapa de Visibilidade com verificação de ativação estrita
           notify(plat, 'publishing', 88, 'Configurando visibilidade pública no YouTube Shorts...');
-          const pubCoordsRes = (await cdpSend(ws, 'Runtime.evaluate', {
-            expression: `
-              (function() {
-                var pubRadio = document.querySelector('tp-yt-paper-radio-button[name="PUBLIC"], [name="PUBLIC"], #privacy-radios tp-yt-paper-radio-button:last-of-type, [aria-label*="Público" i]');
-                if (pubRadio) {
-                  try { pubRadio.scrollIntoView({ block: 'center' }); } catch(_) {}
-                  var rCont = pubRadio.querySelector('#radioContainer, [role="radio"]') || pubRadio;
-                  rCont.click();
-                  pubRadio.click();
-                  pubRadio.dispatchEvent(new Event('change', { bubbles: true }));
-                  var rect = (pubRadio.querySelector('#radioContainer') || pubRadio).getBoundingClientRect();
-                  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, found: true };
-                }
-                return { found: false };
-              })()
-            `,
-            returnByValue: true,
-          })) as { result: { value: { x?: number; y?: number; found: boolean } } };
+          let pubSelected = false;
 
-          if (pubCoordsRes?.result?.value?.found && pubCoordsRes.result.value.x! > 0) {
-            const { x, y } = pubCoordsRes.result.value;
-            await cdpSend(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: x!, y: y!, button: 'left', clickCount: 1 }).catch(() => {});
-            await cdpSend(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: x!, y: y!, button: 'left', clickCount: 1 }).catch(() => {});
+          for (let pRadioAttempt = 0; pRadioAttempt < 20; pRadioAttempt++) {
+            const selectPubScript = `
+              (function() {
+                // 1. Tentar localizar o rádio público por name (case-insensitive), id ou atributo
+                var pubRadio = document.querySelector(
+                  'tp-yt-paper-radio-button[name="PUBLIC" i], ' +
+                  'tp-yt-paper-radio-button[name="public" i], ' +
+                  '[name="PUBLIC" i], ' +
+                  '#privacy-radios tp-yt-paper-radio-button[name="PUBLIC" i], ' +
+                  'tp-yt-paper-radio-button#public-radio-button, ' +
+                  '#public-radio-button, ' +
+                  'ytcp-radio-button[name="PUBLIC" i], ' +
+                  '[test-id="PUBLIC" i]'
+                );
+
+                // 2. Se não encontrou por atributo, varrer os rádios dentro do container de visibilidade
+                if (!pubRadio) {
+                  var privacyGroup = document.querySelector('#privacy-radios, ytcp-video-visibility-select, ytcp-video-metadata-visibility, #first-container');
+                  var container = privacyGroup || document;
+                  var radios = Array.from(container.querySelectorAll('tp-yt-paper-radio-button, ytcp-radio-button, [role="radio"]'));
+
+                  for (var r = 0; r < radios.length; r++) {
+                    var el = radios[r];
+                    var txt = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    // Deve ser especificamente o item Público (e não a descrição de agendamento ou do grupo)
+                    if (
+                      (txt.startsWith('público') || txt.startsWith('public') || txt.includes('todos podem ver') || txt.includes('everyone can watch')) &&
+                      !txt.includes('defina o vídeo') && !txt.includes('selecione uma data')
+                    ) {
+                      pubRadio = el;
+                      break;
+                    }
+                  }
+
+                  // Fallback: no grupo de privacidade do YouTube Studio existem 3 opções na ordem (Privado, Não listado, Público)
+                  if (!pubRadio && radios.length >= 3) {
+                    pubRadio = radios[2];
+                  }
+                }
+
+                // 3. Se ainda não encontrou, buscar por label ou texto direto
+                if (!pubRadio) {
+                  var allLabels = Array.from(document.querySelectorAll('label, span, div.title, #radioLabel, [role="radio"]'));
+                  for (var l = 0; l < allLabels.length; l++) {
+                    var item = allLabels[l];
+                    if (!item.offsetParent && item.getBoundingClientRect().width === 0) continue;
+                    var t = (item.innerText || item.textContent || '').trim().toLowerCase();
+                    if (
+                      (t === 'público' || t === 'public' || t.startsWith('público\\n') || t.startsWith('public\\n')) &&
+                      !t.includes('defina o vídeo') && !t.includes('selecione uma data')
+                    ) {
+                      pubRadio = item.closest('tp-yt-paper-radio-button, ytcp-radio-button, [role="radio"]') || item;
+                      break;
+                    }
+                  }
+                }
+
+                if (pubRadio) {
+                  try { pubRadio.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch(_) {}
+
+                  // Tentar clicar em todas as partes internas possíveis (suportando Shadow DOM)
+                  var shadowCont = pubRadio.shadowRoot ? (pubRadio.shadowRoot.querySelector('#radioContainer') || pubRadio.shadowRoot.querySelector('#radioLabel')) : null;
+                  var lightCont = pubRadio.querySelector('#radioContainer, #radioLabel, [role="radio"]') || pubRadio;
+                  var clickTarget = shadowCont || lightCont;
+
+                  try {
+                    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(ev) {
+                      try { clickTarget.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true, view: window })); } catch(_) {}
+                      try { pubRadio.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true, view: window })); } catch(_) {}
+                    });
+                    if (typeof clickTarget.click === 'function') clickTarget.click();
+                    if (typeof pubRadio.click === 'function') pubRadio.click();
+                  } catch(_) {}
+
+                  try {
+                    pubRadio.checked = true;
+                    pubRadio.setAttribute('checked', '');
+                    pubRadio.setAttribute('aria-checked', 'true');
+                    pubRadio.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                    pubRadio.dispatchEvent(new CustomEvent('iron-change', { bubbles: true, composed: true }));
+                  } catch(_) {}
+
+                  var doneBtn = document.querySelector('#done-button, ytcp-button#done-button, button#done-button');
+                  var isDoneReady = doneBtn && !doneBtn.disabled && doneBtn.getAttribute('aria-disabled') !== 'true' && !doneBtn.hasAttribute('disabled');
+                  var isChecked = (
+                    pubRadio.checked === true ||
+                    pubRadio.getAttribute('aria-checked') === 'true' ||
+                    pubRadio.hasAttribute('checked') ||
+                    (pubRadio.classList && pubRadio.classList.contains('checked'))
+                  );
+
+                  var rect = (clickTarget || pubRadio).getBoundingClientRect();
+                  return {
+                    found: true,
+                    activated: isDoneReady || isChecked,
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2
+                  };
+                }
+                return { found: false, activated: false };
+              })()
+            `;
+
+            const pubRes = (await cdpSend(ws, 'Runtime.evaluate', { expression: selectPubScript, returnByValue: true }).catch(() => null)) as any;
+            const pVal = pubRes?.result?.value;
+
+            if (pVal?.found) {
+              if (pVal.x > 0 && pVal.y > 0) {
+                const px = Math.round(pVal.x);
+                const py = Math.round(pVal.y);
+                await cdpSend(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: px, y: py }).catch(() => {});
+                await new Promise((r) => setTimeout(r, 60));
+                await cdpSend(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: px, y: py, button: 'left', clickCount: 1 }).catch(() => {});
+                await new Promise((r) => setTimeout(r, 100));
+                await cdpSend(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: px, y: py, button: 'left', clickCount: 1 }).catch(() => {});
+              }
+
+              if (pVal.activated) {
+                pubSelected = true;
+                console.log('[YOUTUBE AUTO] Rádio Público selecionado e validado com sucesso!');
+                break;
+              }
+            }
+            await new Promise((r) => setTimeout(r, 1200));
           }
-          // Pausa humanizada de revisão antes de publicar no YouTube (2-4 segundos simulando leitura humana)
-          const reviewPauseYt = Math.floor(Math.random() * 2000) + 2000;
+
+          // Pausa humanizada de revisão antes de confirmar
+          const reviewPauseYt = Math.floor(Math.random() * 2000) + 1500;
           notify(plat, 'publishing', 90, `Revisando publicação antes de confirmar (${Math.round(reviewPauseYt / 1000)}s)...`);
           await new Promise((r) => setTimeout(r, reviewPauseYt));
 
-          // 7. Clicar em "Salvar" / "Publicar" (#done-button) com despacho duplo (DOM + coordenadas físicas CDP)
+          // 7. Clicar em "Salvar" / "Publicar" / "Guardar" (#done-button) com despacho duplo (DOM + coordenadas físicas CDP)
           notify(plat, 'publishing', 92, 'Publicando no YouTube Shorts...');
-          for (let pAttempt = 0; pAttempt < 3; pAttempt++) {
+          for (let pAttempt = 0; pAttempt < 8; pAttempt++) {
             const doneCoordsRes = (await cdpSend(ws, 'Runtime.evaluate', {
               expression: `
                 (function() {
-                  var doneBtn = document.querySelector('#done-button, ytcp-button#done-button, button#done-button, [aria-label*="Publicar" i], [aria-label*="Publish" i]');
+                  var doneBtn = document.querySelector(
+                    '#done-button, ytcp-button#done-button, button#done-button, ' +
+                    '[aria-label*="Publicar" i], [aria-label*="Publish" i], [aria-label*="Guardar" i], [aria-label*="Save" i]'
+                  );
                   if (doneBtn) {
+                    try { doneBtn.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch(_) {}
                     doneBtn.removeAttribute('disabled');
                     doneBtn.removeAttribute('aria-disabled');
-                    var inner = doneBtn.querySelector('button, [role="button"]') || doneBtn;
+                    var inner = doneBtn.querySelector('button, [role="button"], #button') || doneBtn;
                     inner.removeAttribute('disabled');
                     inner.removeAttribute('aria-disabled');
-                    inner.click();
-                    doneBtn.click();
+                    try {
+                      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(ev) {
+                        try { inner.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true, view: window })); } catch(_) {}
+                        try { doneBtn.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true, view: window })); } catch(_) {}
+                      });
+                      inner.click();
+                      doneBtn.click();
+                    } catch(_) {}
                     var rect = inner.getBoundingClientRect();
                     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, found: true };
                   }
@@ -10264,19 +11444,25 @@ ipcMain.handle('auto-publish-video', async (event, {
             })) as { result: { value: { x?: number; y?: number; found: boolean } } };
 
             if (doneCoordsRes?.result?.value?.found && doneCoordsRes.result.value.x! > 0) {
-              const { x, y } = doneCoordsRes.result.value;
-              await cdpSend(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: x!, y: y!, button: 'left', clickCount: 1 }).catch(() => {});
-              await cdpSend(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: x!, y: y!, button: 'left', clickCount: 1 }).catch(() => {});
-              console.log('[YOUTUBE AUTO] Clique físico e sintético enviado com sucesso ao #done-button');
+              const dx = Math.round(doneCoordsRes.result.value.x!);
+              const dy = Math.round(doneCoordsRes.result.value.y!);
+              await cdpSend(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: dx, y: dy }).catch(() => {});
+              await new Promise((r) => setTimeout(r, 60));
+              await cdpSend(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: dx, y: dy, button: 'left', clickCount: 1 }).catch(() => {});
+              await new Promise((r) => setTimeout(r, 100));
+              await cdpSend(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: dx, y: dy, button: 'left', clickCount: 1 }).catch(() => {});
             }
 
-            await new Promise((r) => setTimeout(r, 1000));
+            await new Promise((r) => setTimeout(r, 1200));
 
-            // Tratar possível popup de confirmação ("Publicar mesmo assim" / "Publish anyway" / etc.)
+            // Tratar possível diálogo de confirmação ("Publicar mesmo assim" / "Publish anyway")
             await cdpSend(ws, 'Runtime.evaluate', {
               expression: `
                 (function() {
-                  var confirmBtn = document.querySelector('ytcp-confirmation-dialog #confirm-button, ytcp-dialog #confirm-button, #confirm-button, button[aria-label*="Publicar mesmo assim" i]');
+                  var confirmBtn = document.querySelector(
+                    'ytcp-confirmation-dialog #confirm-button, ytcp-dialog #confirm-button, #confirm-button, ' +
+                    'button[aria-label*="Publicar mesmo assim" i], button[aria-label*="Publish anyway" i]'
+                  );
                   if (confirmBtn) {
                     var cInner = confirmBtn.querySelector('button, [role="button"]') || confirmBtn;
                     cInner.click();
@@ -10289,52 +11475,141 @@ ipcMain.handle('auto-publish-video', async (event, {
             }).catch(() => {});
 
             await new Promise((r) => setTimeout(r, 1500));
-          }
 
-          // 8. Confirmação estrita do YouTube
-          notify(plat, 'publishing', 97, 'Aguardando confirmação definitiva do YouTube...');
-          let ytConfirmed = false;
-          for (let conf = 0; conf < 30; conf++) {
-            await new Promise((r) => setTimeout(r, 1500));
-            const checkYtDone = `
-              (function() {
-                var bodyText = document.body ? document.body.innerText : '';
-                if (
-                  bodyText.includes('Vídeo publicado') ||
-                  bodyText.includes('Video published') ||
-                  bodyText.includes('Short publicado') ||
-                  bodyText.includes('O processamento do vídeo foi concluído') ||
-                  bodyText.includes('Carregamento concluído')
-                ) {
-                  return true;
-                }
-                var closeBtn = document.querySelector('#close-button, button#close-button');
-                var shareDialog = document.querySelector('ytcp-video-share-dialog');
-                if (shareDialog || closeBtn) return true;
-                return false;
-              })()
-            `;
-            const ytDoneRes = (await cdpSend(ws, 'Runtime.evaluate', { expression: checkYtDone, returnByValue: true })) as { result: { value: boolean } };
-            if (ytDoneRes?.result?.value) {
-              ytConfirmed = true;
+            // Verificar se o diálogo de share já abriu
+            const checkQuickShare = `!!document.querySelector('ytcp-video-share-dialog, ytcp-dialog[dialog-type="SHARE"]')`;
+            const qsRes = (await cdpSend(ws, 'Runtime.evaluate', { expression: checkQuickShare, returnByValue: true }).catch(() => null)) as any;
+            if (qsRes?.result?.value) {
+              console.log('[YOUTUBE AUTO] Diálogo de compartilhamento detectado imediatamente após o clique!');
               break;
             }
           }
 
-          if (!ytConfirmed) {
-            throw new Error('Publicação enviada ao YouTube, mas a tela de confirmação não foi detectada a tempo. Não foi marcado como publicado.');
+          // 8. Confirmação estrita e resiliente de publicação no YouTube Shorts
+          notify(plat, 'publishing', 95, 'Aguardando confirmação definitiva do YouTube...');
+          let ytConfirmed = false;
+          let ytConfirmReason = '';
+
+          for (let conf = 0; conf < 60; conf++) {
+            await new Promise((r) => setTimeout(r, 1500));
+
+            // A cada 4 iterações (~6s), se ainda houver botão de confirmação ou done visível, re-acionar
+            if (conf > 0 && conf % 4 === 0) {
+              try {
+                await cdpSend(ws, 'Runtime.evaluate', {
+                  expression: `
+                    (function() {
+                      var confirmBtn = document.querySelector(
+                        'ytcp-confirmation-dialog #confirm-button, ytcp-dialog #confirm-button, #confirm-button, ' +
+                        'button[aria-label*="Publicar mesmo assim" i], button[aria-label*="Publish anyway" i], ' +
+                        'button[aria-label*="Guardar" i], button[aria-label*="Save" i]'
+                      );
+                      if (confirmBtn && !confirmBtn.disabled && confirmBtn.getAttribute('aria-disabled') !== 'true') {
+                        var cInner = confirmBtn.querySelector('button, [role="button"]') || confirmBtn;
+                        cInner.click();
+                        confirmBtn.click();
+                        return true;
+                      }
+                      var doneBtn = document.querySelector('#done-button, ytcp-button#done-button, button#done-button');
+                      if (doneBtn && !doneBtn.disabled && doneBtn.getAttribute('aria-disabled') !== 'true') {
+                        var dInner = doneBtn.querySelector('button, [role="button"]') || doneBtn;
+                        dInner.click();
+                        doneBtn.click();
+                        return true;
+                      }
+                      return false;
+                    })()
+                  `,
+                }, undefined, 5000);
+              } catch (_) {}
+            }
+
+            const checkYtDone = `
+              (function() {
+                var bodyText = (document.body ? document.body.innerText : '').toLowerCase();
+
+                // 1. Frases de sucesso explícitas no corpo (pt-PT, pt-BR, EN, ES)
+                var successPhrases = [
+                  'vídeo publicado', 'video publicado', 'video published', 'short publicado',
+                  'o teu vídeo foi publicado', 'o seu vídeo foi publicado', 'o teu short foi publicado', 'o seu short foi publicado',
+                  'o processamento do vídeo foi concluído', 'o processamento do short foi concluído',
+                  'o processamento continuará em segundo plano', 'o processamento continuará',
+                  'o envio continuará em segundo plano', 'o carregamento continuará em segundo plano',
+                  'o upload continuará em segundo plano', 'o upload continuará',
+                  'carregamento concluído', 'upload complete', 'envio concluído', 'envio terminado',
+                  'o link do teu vídeo', 'link do seu vídeo', 'o link do vídeo',
+                  'o link do teu short', 'link do seu short', 'link do short',
+                  'o teu vídeo está agora visível', 'o seu vídeo já está disponível', 'o teu vídeo é agora público',
+                  'o seu vídeo já é público', 'video link', 'short link'
+                ];
+
+                for (var s = 0; s < successPhrases.length; s++) {
+                  if (bodyText.includes(successPhrases[s])) {
+                    return { confirmed: true, reason: 'phrase:' + successPhrases[s] };
+                  }
+                }
+
+                // 2. Diálogo oficial de compartilhamento (ytcp-video-share-dialog)
+                var shareDialog = document.querySelector('ytcp-video-share-dialog, ytcp-dialog[dialog-type="SHARE"], ytcp-share-dialog');
+                if (shareDialog) {
+                  var sdStyle = window.getComputedStyle(shareDialog);
+                  if (sdStyle.display !== 'none' && sdStyle.visibility !== 'hidden') {
+                    return { confirmed: true, reason: 'share_dialog' };
+                  }
+                }
+
+                // 3. Toasts ou Snackbars de confirmação
+                var toasts = document.querySelectorAll('tp-yt-paper-toast, ytcp-toast, mwc-snackbar, #toast, .ytcp-toast');
+                for (var t = 0; t < toasts.length; t++) {
+                  var tText = (toasts[t].innerText || toasts[t].textContent || '').toLowerCase();
+                  if (
+                    tText.includes('publicado') || tText.includes('published') ||
+                    tText.includes('concluído') || tText.includes('completo') ||
+                    tText.includes('processamento') || tText.includes('segundo plano')
+                  ) {
+                    return { confirmed: true, reason: 'toast:' + tText.substring(0, 30) };
+                  }
+                }
+
+                return { confirmed: false };
+              })()
+            `;
+
+            try {
+              const ytDoneRes = (await cdpSend(ws, 'Runtime.evaluate', {
+                expression: checkYtDone,
+                returnByValue: true
+              }, undefined, 8000)) as { result?: { value?: { confirmed: boolean; reason?: string } } };
+
+              const val = ytDoneRes?.result?.value;
+              if (val?.confirmed) {
+                ytConfirmed = true;
+                ytConfirmReason = val.reason || 'detected';
+                console.log('[YOUTUBE AUTO] Confirmação detectada com sucesso! Motivo:', ytConfirmReason);
+                break;
+              }
+            } catch (_) {}
+
+            if (conf % 5 === 0) {
+              notify(plat, 'publishing', Math.min(95 + Math.floor(conf / 12), 98), `Aguardando confirmação definitiva do YouTube (${Math.round((conf + 1) * 1.5)}s)...`);
+            }
           }
 
-          // Fechar modal de compartilhamento do YouTube e retornar de forma limpa e blindada ao YouTube Studio
-          notify(plat, 'publishing', 99, 'Fechando diálogo de publicação e retornando ao YouTube Studio...');
+          if (!ytConfirmed) {
+            throw new Error('Publicação enviada ao YouTube, mas a tela de confirmação não foi detectada a tempo. O vídeo NÃO foi marcado como publicado.');
+          }
+
+          // 9. Fechar apenas o diálogo de compartilhamento do YouTube (se visível) sem resetar a página
+          notify(plat, 'publishing', 99, 'Finalizando publicação no YouTube Studio...');
           try {
             await cdpSend(ws, 'Runtime.evaluate', {
               expression: `
                 (function() {
                   var closeBtns = document.querySelectorAll(
-                    'ytcp-video-share-dialog #close-button, ytcp-uploads-dialog #close-button, ' +
-                    '#close-button, button#close-button, ytcp-button#close-button, ' +
-                    '[aria-label*="Fechar" i], [aria-label*="Close" i]'
+                    'ytcp-video-share-dialog #close-button, ' +
+                    'ytcp-video-share-dialog button#close-button, ' +
+                    'ytcp-video-share-dialog [aria-label*="Fechar" i], ' +
+                    'ytcp-video-share-dialog [aria-label*="Close" i]'
                   );
                   for (var cb = 0; cb < closeBtns.length; cb++) {
                     try {
@@ -10351,13 +11626,6 @@ ipcMain.handle('auto-publish-video', async (event, {
           } catch(_) {}
 
           await new Promise((r) => setTimeout(r, 1500));
-
-          // Navegar de volta à raiz limpa do YouTube Studio mantendo toda a blindagem ativa
-          try {
-            await cdpSend(ws, 'Page.navigate', { url: 'https://studio.youtube.com/' });
-            await new Promise((r) => setTimeout(r, 1500));
-            await injectSecurityShieldToSession(ws, { isSignup: false });
-          } catch(_) {}
 
           notify(plat, 'done', 100, 'Publicado e confirmado com sucesso no YouTube Shorts!');
           results[plat] = { success: true };
@@ -10390,6 +11658,9 @@ ipcMain.handle('auto-publish-video', async (event, {
                     freshWs.once('open', () => resolve());
                     freshWs.once('error', reject);
                   });
+                  await cdpSend(freshWs, 'Runtime.enable', undefined, undefined, 4000).catch(() => {});
+                  await cdpSend(freshWs, 'Page.enable', undefined, undefined, 4000).catch(() => {});
+                  await cdpSend(freshWs, 'DOM.enable', undefined, undefined, 4000).catch(() => {});
                   return freshWs;
                 }
               } catch {}
@@ -10397,211 +11668,434 @@ ipcMain.handle('auto-publish-video', async (event, {
             return null;
           };
 
-          // 1. Garantir que a publicação ocorra no contexto de Administrador da Página
           let activeWs = ws;
           const sessionDebugPort = targetSession?.debugPort || 0;
 
-          if (targetPageUrl) {
+          // Helper: Avaliação segura e resiliente a quedas de WebSocket e congelamento do V8 do Facebook
+          const safeEvaluate = async (
+            expression: string,
+            timeoutMs = 12000,
+            returnByValue = true
+          ): Promise<any> => {
+            try {
+              if (!activeWs || activeWs.readyState !== WebSocket.OPEN) {
+                if (sessionDebugPort) {
+                  const reacq = await reacquireWs(sessionDebugPort, 8000);
+                  if (reacq) {
+                    try { activeWs.close(); } catch {}
+                    activeWs = reacq;
+                    if (targetSession) targetSession.ws = activeWs;
+                  }
+                }
+              }
+              if (!activeWs || activeWs.readyState !== WebSocket.OPEN) return null;
+              return await cdpSend(activeWs, 'Runtime.evaluate', { expression, returnByValue }, undefined, timeoutMs);
+            } catch (err: any) {
+              console.warn('[FACEBOOK AUTO] safeEvaluate captura segura:', err?.message || err);
+              if (sessionDebugPort && (err?.message?.includes('timeout') || err?.message?.includes('socket') || err?.message?.includes('closed') || err?.message?.includes('destroyed'))) {
+                try {
+                  const reacq = await reacquireWs(sessionDebugPort, 6000);
+                  if (reacq) {
+                    try { activeWs.close(); } catch {}
+                    activeWs = reacq;
+                    if (targetSession) targetSession.ws = activeWs;
+                  }
+                } catch (_) {}
+              }
+              return null;
+            }
+          };
+
+          // Helper: Aguardar prontidão da página (document.readyState) sem travar
+          const waitForPageReady = async (maxWaitMs = 15000): Promise<boolean> => {
+            const deadline = Date.now() + maxWaitMs;
+            while (Date.now() < deadline) {
+              const res: any = await safeEvaluate('document.readyState', 4000, true);
+              const state = res?.result?.value;
+              if (state === 'complete' || state === 'interactive') {
+                return true;
+              }
+              await new Promise((r) => setTimeout(r, 800));
+            }
+            return false;
+          };
+
+          // Helper: Descartar popups de cookies, notificações e boas-vindas do Facebook
+          const dismissFacebookPopups = async (): Promise<void> => {
+            const script = `
+              (function() {
+                try {
+                  // 1. Banners de cookies da Meta
+                  var cookieBtns = document.querySelectorAll('button, div[role="button"]');
+                  for (var i = 0; i < cookieBtns.length; i++) {
+                    var b = cookieBtns[i];
+                    var t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                    if (
+                      t === 'permitir todos os cookies' || t === 'aceitar todos os cookies' ||
+                      t === 'permitir cookies' || t === 'aceitar cookies' ||
+                      t === 'allow all cookies' || t === 'accept all' || t === 'allow essential and optional cookies'
+                    ) {
+                      b.click();
+                      break;
+                    }
+                  }
+
+                  // 2. Diálogos de notificações ("Agora não" / "Not now")
+                  var notifBtns = document.querySelectorAll('div[role="dialog"] button, div[role="dialog"] div[role="button"]');
+                  for (var j = 0; j < notifBtns.length; j++) {
+                    var nb = notifBtns[j];
+                    var nt = (nb.innerText || nb.textContent || '').trim().toLowerCase();
+                    if (nt === 'agora não' || nt === 'agora nao' || nt === 'not now' || nt === 'talvez mais tarde' || nt === 'cancelar') {
+                      nb.click();
+                    }
+                  }
+                } catch(_) {}
+              })()
+            `;
+            await safeEvaluate(script, 6000, false);
+          };
+
+          // Ativar bypass do Shield durante TODA a publicação automática no Facebook
+          // O bypass impede que o Shield oculte ou bloqueie botões necessários (Switch, Next, Publish)
+          if (targetSession) targetSession.isPublishing = true;
+          console.log('[FACEBOOK AUTO] Ativando bypass do Shield para publicação automática...');
+          await safeEvaluate('window.__AGENT_AUTO_PUBLISHING__ = true;', 4000, false);
+
+          // Verificar se o perfil já foi alternado para a Página em sessão anterior (flag persistente em disco)
+          const fbSwitchedFlag = targetSession?.profileDir ? path.join(targetSession.profileDir, 'fb_page_switched.flag') : '';
+          const hasAlreadySwitched = Boolean(fbSwitchedFlag && fsSync.existsSync(fbSwitchedFlag));
+
+          if (hasAlreadySwitched) {
+            console.log('[FACEBOOK AUTO] Perfil já alternado para a Página anteriormente (fb_page_switched.flag presente). Pulando etapa de alternância e indo direto para Reels!');
+            notify(plat, 'uploading', 35, 'Identidade da Página já configurada. Acessando estúdio de Reels...');
+          } else if (targetPageUrl) {
             notify(plat, 'uploading', 25, 'Acessando Página do Facebook para ativar voz de Administrador...');
             try {
-              // Navegar via window.location.href — Page.navigate dá CDP timeout em modo --app após navegação
-              await cdpSend(activeWs, 'Runtime.evaluate', {
-                expression: `window.location.href = ${JSON.stringify(targetPageUrl)};`,
-              }).catch(() => {});
+              await safeEvaluate(`window.location.href = ${JSON.stringify(targetPageUrl)};`, 6000, false);
               await new Promise((r) => setTimeout(r, 4000));
 
-              // Re-adquirir WS após navegação (WS antigo fica inválido quando a página muda)
+              // Re-adquirir WS após navegação
               if (sessionDebugPort) {
                 const reacq = await reacquireWs(sessionDebugPort, 12000);
                 if (reacq) {
                   try { activeWs.close(); } catch {}
                   activeWs = reacq;
                   if (targetSession) targetSession.ws = activeWs;
-                  await cdpSend(activeWs, 'Runtime.enable').catch(() => {});
                 }
               }
 
-              // Polling para botão "Alternar" / "Trocar agora"
-              notify(plat, 'uploading', 32, 'Verificando identidade da Página...');
+              await waitForPageReady(12000);
+              await dismissFacebookPopups();
+
+              // Temporariamente desativar bloqueios do Shield para permitir alternância de Página
+              console.log('[FACEBOOK AUTO] Ativando bypass temporário do Shield para alternância de Página...');
+              await safeEvaluate(`
+                (function() {
+                  window.__AGENT_AUTO_PUBLISHING__ = true;
+                  // Remover CSS de bloqueio que oculta botões de alternância
+                  var css = document.getElementById('agent-post-login-css');
+                  if (css) css.remove();
+                  // Restaurar todos os elementos bloqueados pelo agente
+                  var blocked = document.querySelectorAll('[data-blocked-by-agent="true"]');
+                  for (var i = 0; i < blocked.length; i++) {
+                    blocked[i].style.removeProperty('display');
+                    blocked[i].style.removeProperty('visibility');
+                    blocked[i].style.removeProperty('opacity');
+                    blocked[i].style.removeProperty('pointer-events');
+                    blocked[i].removeAttribute('data-blocked-by-agent');
+                  }
+                })()
+              `, 6000, false);
+
+              // 1. Verificar primeiro se já está na voz de Administrador da Página
               let switchClicked = false;
-              for (let sAttempt = 0; sAttempt < 10; sAttempt++) {
-                await new Promise((r) => setTimeout(r, 1200));
-                try {
-                  const switchRes = (await cdpSend(activeWs, 'Runtime.evaluate', {
-                    expression: `
+              let pageVoiceConfirmed = false;
+
+              const checkVoiceRes = await safeEvaluate(`
+                (function() {
+                  var allInteractive = Array.from(document.querySelectorAll('a, button, div[role="button"], div[role="tab"]'));
+                  for (var i = 0; i < allInteractive.length; i++) {
+                    var el = allInteractive[i];
+                    var txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                    var aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                    if (
+                      txt === 'gerir' || txt === 'manage' ||
+                      txt === 'painel profissional' || txt === 'professional dashboard' ||
+                      txt === 'editar página' || txt === 'edit page' ||
+                      aria === 'gerir' || aria === 'manage' ||
+                      aria.includes('painel profissional') || aria.includes('professional dashboard')
+                    ) {
+                      return { isAdmin: true, text: txt || aria };
+                    }
+                  }
+                  return { isAdmin: false };
+                })()
+              `, 6000, true);
+
+              if (checkVoiceRes?.result?.value?.isAdmin) {
+                console.log('[FACEBOOK AUTO] Voz de Administrador já ativa na Página:', checkVoiceRes.result.value.text);
+                pageVoiceConfirmed = true;
+              } else {
+                // Polling para botão "Alternar" / "Switch into" na Página
+                notify(plat, 'uploading', 32, 'Verificando identidade e ativando voz da Página...');
+                for (let sAttempt = 0; sAttempt < 6; sAttempt++) {
+                  await new Promise((r) => setTimeout(r, 1200));
+                  try {
+                    const switchRes = await safeEvaluate(`
                       (function() {
-                        var buttons = Array.from(document.querySelectorAll('button, div[role="button"], a[role="button"]'));
-                        for (var i = 0; i < buttons.length; i++) {
-                          var btn = buttons[i];
-                          var txt = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-                          var aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-                          var isSwitch = (
+                        var allInteractive = Array.from(document.querySelectorAll('button, div[role="button"], a[role="button"], a[href*="switch"]'));
+                        for (var i = 0; i < allInteractive.length; i++) {
+                          var el = allInteractive[i];
+                          if (!el.offsetParent && el.getBoundingClientRect().width === 0) continue;
+                          var txt = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+                          var aria = (el.getAttribute('aria-label') || '').toLowerCase().replace(/\\s+/g, ' ');
+                          
+                          var isSwitchBtn = (
                             txt === 'alternar' || txt === 'switch' || txt === 'trocar' || txt === 'mudar' ||
                             txt === 'mudar agora' || txt === 'alternar agora' || txt === 'switch now' ||
                             txt === 'trocar agora' || txt === 'troque agora' ||
-                            txt.includes('alternar para') || txt.includes('mudar para') || txt.includes('switch to') ||
-                            aria === 'alternar' || aria === 'switch' || aria.includes('alternar') || aria.includes('troque para')
+                            txt.startsWith('switch into') || txt.startsWith('switch to') || txt.startsWith('switch now') ||
+                            txt.includes('switch into') || txt.includes('switch to') || txt.includes('alternar para') ||
+                            txt.includes('mudar para') || txt.includes('trocar para') || txt.includes('use page') ||
+                            aria === 'alternar' || aria === 'switch' || aria.includes('switch into') ||
+                            aria.includes('switch to') || aria.includes('switch profile') || aria.includes('alternar') ||
+                            aria.includes('mudar para') || aria.includes('troque para')
                           );
-                          if (isSwitch) {
-                            btn.click();
-                            return { switched: true, text: txt, aria: aria };
+
+                          if (isSwitchBtn) {
+                            try { el.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch(_) {}
+                            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(ev) {
+                              try { el.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true, view: window })); } catch(_) {}
+                            });
+                            try { el.click(); } catch(_) {}
+                            var r = el.getBoundingClientRect();
+                            return { switched: true, text: txt || aria, x: r.left + r.width / 2, y: r.top + r.height / 2 };
                           }
                         }
                         return { switched: false };
                       })()
-                    `,
-                    returnByValue: true,
-                  })) as { result?: { value?: { switched: boolean; text?: string; aria?: string } } };
+                    `, 8000, true);
 
-                  if (switchRes?.result?.value?.switched) {
-                    console.log('[FACEBOOK AUTO] Clique inicial acionado:', switchRes.result.value);
-                    switchClicked = true;
+                    const sVal = switchRes?.result?.value;
+                    if (sVal?.switched) {
+                      console.log('[FACEBOOK AUTO] Clique inicial de alternância detectado:', sVal.text);
+                      switchClicked = true;
 
-                    // Aguardar diálogo aparecer
-                    await new Promise((r) => setTimeout(r, 1800));
+                      if (sVal.x && sVal.y && sVal.x > 0 && sVal.y > 0) {
+                        const sx = Math.round(sVal.x);
+                        const sy = Math.round(sVal.y);
+                        await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: sx, y: sy }, undefined, 3000).catch(() => {});
+                        await new Promise((r) => setTimeout(r, 60));
+                        await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: sx, y: sy, button: 'left', clickCount: 1 }, undefined, 3000).catch(() => {});
+                        await new Promise((r) => setTimeout(r, 100));
+                        await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: sx, y: sy, button: 'left', clickCount: 1 }, undefined, 3000).catch(() => {});
+                      }
 
-                    // Clicar no botão de CONFIRMAÇÃO dentro do diálogo "Trocar de perfil"
-                    const confirmRes = (await cdpSend(activeWs, 'Runtime.evaluate', {
-                      expression: `
+                      await new Promise((r) => setTimeout(r, 2000));
+
+                      // Tratar possível diálogo modal de confirmação ("Trocar de perfil" / "Switch into...")
+                      const confirmRes = await safeEvaluate(`
                         (function() {
-                          var dialogs = document.querySelectorAll('div[role="dialog"], div[aria-modal="true"]');
+                          var dialogs = Array.from(document.querySelectorAll('div[role="dialog"], div[aria-modal="true"]'));
                           for (var d = 0; d < dialogs.length; d++) {
                             var diag = dialogs[d];
                             var diagText = (diag.innerText || diag.textContent || '').toLowerCase();
-                            if (
+                            var isSwitchDialog = (
                               diagText.includes('trocar de perfil') || diagText.includes('troque para') ||
                               diagText.includes('mudar para') || diagText.includes('alternar para') ||
-                              diagText.includes('switch to') || diagText.includes('alternar')
-                            ) {
+                              diagText.includes('switch to') || diagText.includes('switch into') ||
+                              diagText.includes('switch profile') || diagText.includes('alternar') ||
+                              diagText.includes('switch')
+                            );
+                            if (isSwitchDialog) {
                               var btns = Array.from(diag.querySelectorAll('button, div[role="button"]'));
                               for (var b = 0; b < btns.length; b++) {
                                 var btn = btns[b];
                                 var txt = (btn.innerText || btn.textContent || '').trim().toLowerCase();
                                 var aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-                                if (txt === 'alternar' || aria === 'alternar' || txt === 'mudar' || txt === 'confirmar' || txt === 'switch' || txt === 'confirm') {
-                                  btn.click();
-                                  return { confirmed: true, text: txt };
+                                var isConfirm = (
+                                  txt === 'alternar' || txt === 'switch' || txt === 'mudar' || txt === 'confirmar' ||
+                                  txt === 'confirm' || txt === 'switch profile' || txt === 'continue' || txt === 'continuar' ||
+                                  aria.includes('switch') || aria.includes('alternar') || aria.includes('confirm')
+                                );
+                                if (isConfirm) {
+                                  try { btn.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch(_) {}
+                                  ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(ev) {
+                                    try { btn.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true, view: window })); } catch(_) {}
+                                  });
+                                  try { btn.click(); } catch(_) {}
+                                  var r = btn.getBoundingClientRect();
+                                  return { confirmed: true, text: txt, x: r.left + r.width / 2, y: r.top + r.height / 2 };
                                 }
                               }
                             }
                           }
                           return { confirmed: false };
                         })()
-                      `,
-                      returnByValue: true,
-                    })) as { result?: { value?: { confirmed: boolean; text?: string } } };
+                      `, 8000, true);
 
-                    console.log('[FACEBOOK AUTO] Confirmação no diálogo:', confirmRes?.result?.value);
-                    notify(plat, 'uploading', 36, 'Troca de identidade confirmada! Aguardando transição...');
-
-                    // Aguardar página recarregar após confirmação
-                    await new Promise((r) => setTimeout(r, 5000));
-
-                    // Re-adquirir WS após transição de perfil
-                    if (sessionDebugPort) {
-                      const reacqAfterSwitch = await reacquireWs(sessionDebugPort, 12000);
-                      if (reacqAfterSwitch) {
-                        try { activeWs.close(); } catch {}
-                        activeWs = reacqAfterSwitch;
-                        if (targetSession) targetSession.ws = activeWs;
-                        await cdpSend(activeWs, 'Runtime.enable').catch(() => {});
+                      const cVal = confirmRes?.result?.value;
+                      if (cVal?.confirmed && cVal.x && cVal.y && cVal.x > 0 && cVal.y > 0) {
+                        const cx = Math.round(cVal.x);
+                        const cy = Math.round(cVal.y);
+                        await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy }, undefined, 3000).catch(() => {});
+                        await new Promise((r) => setTimeout(r, 60));
+                        await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1 }, undefined, 3000).catch(() => {});
+                        await new Promise((r) => setTimeout(r, 100));
+                        await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 }, undefined, 3000).catch(() => {});
+                        console.log('[FACEBOOK AUTO] Confirmação no diálogo acionada:', cVal.text);
                       }
+
+                      notify(plat, 'uploading', 36, 'Identidade da Página confirmada! Aguardando transição...');
+                      await new Promise((r) => setTimeout(r, 5000));
+
+                      if (sessionDebugPort) {
+                        const reacqAfterSwitch = await reacquireWs(sessionDebugPort, 15000);
+                        if (reacqAfterSwitch) {
+                          try { activeWs.close(); } catch {}
+                          activeWs = reacqAfterSwitch;
+                          if (targetSession) targetSession.ws = activeWs;
+                        }
+                      }
+                      await waitForPageReady(12000);
+                      pageVoiceConfirmed = true;
+                      break;
                     }
-                    break;
+                  } catch (sErr) {
+                    console.warn('[FACEBOOK AUTO] Erro durante verificação de alternância:', sErr);
                   }
-                } catch (sErr) {
-                  console.warn('[FACEBOOK AUTO] Erro ao tentar alternar:', sErr);
                 }
               }
 
-              if (!switchClicked) {
-                console.log('[FACEBOOK AUTO] Sem botão de alternância — já na voz da Página!');
-                notify(plat, 'uploading', 36, 'Voz de Administrador da Página já ativa!');
+              // Gravar a flag persistente para que nas próximas publicações não precise alternar nunca mais!
+              if (pageVoiceConfirmed || switchClicked) {
+                if (fbSwitchedFlag) {
+                  try {
+                    fsSync.writeFileSync(fbSwitchedFlag, new Date().toISOString());
+                    console.log('[FACEBOOK AUTO] Flag fb_page_switched.flag gravada com sucesso! Próximas publicações irão direto para os Reels.');
+                  } catch (flagErr) {
+                    console.warn('[FACEBOOK AUTO] Aviso ao gravar flag de alternância:', flagErr);
+                  }
+                }
+                notify(plat, 'uploading', 38, 'Voz da Página configurada e salva com sucesso!');
+              } else {
+                console.log('[FACEBOOK AUTO] Nenhum botão de alternância encontrado na Página — prosseguindo para Reels...');
+                notify(plat, 'uploading', 36, 'Voz de Administrador da Página ativa!');
               }
             } catch (switchErr) {
-              console.warn('[FACEBOOK AUTO] Aviso ao verificar alternância para Página:', switchErr);
+              console.warn('[FACEBOOK AUTO] Aviso ao alternar para Página:', switchErr);
             }
           }
 
           notify(plat, 'uploading', 40, 'Acessando estúdio de Reels como Administrador da Página...');
 
-          // Navegar para /reels/create/ via window.location.href (Page.navigate dá timeout em --app mode)
-          try {
-            await cdpSend(activeWs, 'Runtime.evaluate', {
-              expression: 'window.location.href = "https://www.facebook.com/reels/create/";',
-            }).catch(() => {});
-          } catch {}
-          await new Promise((r) => setTimeout(r, 1500));
+          // Navegar para /reels/create/ usando o mesmo subdomínio da Página atribuída
+          const fbDomain = (targetPageUrl && targetPageUrl.includes('web.facebook.com')) ? 'web.facebook.com' : 'www.facebook.com';
 
-          // Re-adquirir WS após navegar para reels/create
-          if (sessionDebugPort) {
-            const reacqReels = await reacquireWs(sessionDebugPort, 18000);
-            if (reacqReels) {
-              try { activeWs.close(); } catch {}
-              activeWs = reacqReels;
-              if (targetSession) targetSession.ws = activeWs;
+          // Verificar se já estamos em /reels/create/; se não, navegar e confirmar
+          for (let rAttempt = 0; rAttempt < 5; rAttempt++) {
+            const checkUrlRes = await safeEvaluate('window.location.href', 4000, true);
+            const currentUrl = (checkUrlRes?.result?.value || '').toLowerCase();
+            if (currentUrl.includes('/reels/create')) {
+              break;
             }
+            console.log(`[FACEBOOK AUTO] URL atual (${currentUrl}) não é /reels/create/. Navegando...`);
+            await safeEvaluate(`window.location.href = "https://${fbDomain}/reels/create/";`, 8000, false);
+            await new Promise((r) => setTimeout(r, 3000));
+            if (sessionDebugPort) {
+              const reacqReels = await reacquireWs(sessionDebugPort, 12000);
+              if (reacqReels) {
+                try { activeWs.close(); } catch {}
+                activeWs = reacqReels;
+                if (targetSession) targetSession.ws = activeWs;
+              }
+            }
+            await waitForPageReady(12000);
           }
 
-          // Aguardar Reels carregar e injetar shield
-          await new Promise((r) => setTimeout(r, 4000));
+          // Aguardar a página do Reels carregar de verdade
+          await waitForPageReady(18000);
+
+          // IMPORTANTE: Re-ativar bypass ANTES de injetar o Shield para que ele não bloqueie nada no wizard
+          await safeEvaluate('window.__AGENT_AUTO_PUBLISHING__ = true;', 4000, false);
           await injectSecurityShieldToSession(activeWs, { isSignup: false, pageUrl: targetPageUrl }).catch(() => {});
 
-          // Wrappers locais que usam activeWs (o WS foi trocado após navegação, os closures originais usam ws antigo)
+          // Garantir que o bypass persiste: remover CSS e desbloquear elementos marcados pelo Shield
+          await safeEvaluate(`
+            (function() {
+              window.__AGENT_AUTO_PUBLISHING__ = true;
+              var css = document.getElementById('agent-post-login-css');
+              if (css) css.remove();
+              var blocked = document.querySelectorAll('[data-blocked-by-agent="true"]');
+              for (var i = 0; i < blocked.length; i++) {
+                blocked[i].style.removeProperty('display');
+                blocked[i].style.removeProperty('visibility');
+                blocked[i].style.removeProperty('opacity');
+                blocked[i].style.removeProperty('pointer-events');
+                blocked[i].removeAttribute('data-blocked-by-agent');
+              }
+            })()
+          `, 6000, false);
+
+          await dismissFacebookPopups();
+
+          // Wrappers locais seguros que usam activeWs atualizado
           const fbLocateFileInput = async (): Promise<number> => {
             try {
-              const evalRes = (await cdpSend(activeWs, 'Runtime.evaluate', {
-                expression: `
-                  (function() {
-                    function searchDoc(doc) {
-                      if (!doc) return null;
-                      var el = doc.querySelector('input[type="file"], input[accept*="video"], input[accept*="mp4"]');
-                      if (el) return el;
-                      var all = doc.querySelectorAll('*');
-                      for (var i = 0; i < all.length; i++) {
-                        if (all[i].shadowRoot) { var f = searchDoc(all[i].shadowRoot); if (f) return f; }
-                      }
-                      return null;
+              const evalRes: any = await safeEvaluate(`
+                (function() {
+                  if (!window.location.href.toLowerCase().includes('/reels/create')) {
+                    return null;
+                  }
+                  function searchDoc(doc) {
+                    if (!doc) return null;
+                    var el = doc.querySelector('input[type="file"][accept*="video"], input[type="file"][accept*="mp4"], input[type="file"]');
+                    if (el) return el;
+                    var all = doc.querySelectorAll('*');
+                    for (var i = 0; i < all.length; i++) {
+                      if (all[i].shadowRoot) { var f = searchDoc(all[i].shadowRoot); if (f) return f; }
                     }
-                    return searchDoc(document);
-                  })()
-                `,
-              })) as { result?: { objectId?: string } };
+                    return null;
+                  }
+                  return searchDoc(document);
+                })()
+              `, 8000, false);
               if (evalRes?.result?.objectId) {
-                const nodeRes = (await cdpSend(activeWs, 'DOM.requestNode', { objectId: evalRes.result.objectId })) as { nodeId?: number };
+                const nodeRes = (await cdpSend(activeWs, 'DOM.requestNode', { objectId: evalRes.result.objectId }, undefined, 6000).catch(() => null)) as { nodeId?: number } | null;
                 if (nodeRes?.nodeId) return nodeRes.nodeId;
               }
             } catch {}
             try {
-              const docRes = (await cdpSend(activeWs, 'DOM.getDocument', { depth: -1, pierce: true })) as { root: { nodeId: number } };
-              for (const sel of ['input[type="file"]', 'input[accept*="video"]', 'input[accept*="mp4"]']) {
-                const qRes = (await cdpSend(activeWs, 'DOM.querySelector', { nodeId: docRes.root.nodeId, selector: sel })) as { nodeId: number };
-                if (qRes?.nodeId) return qRes.nodeId;
+              const docRes = (await cdpSend(activeWs, 'DOM.getDocument', { depth: -1, pierce: true }, undefined, 6000).catch(() => null)) as { root?: { nodeId: number } } | null;
+              if (docRes?.root?.nodeId) {
+                for (const sel of ['input[type="file"]', 'input[accept*="video"]', 'input[accept*="mp4"]']) {
+                  const qRes = (await cdpSend(activeWs, 'DOM.querySelector', { nodeId: docRes.root.nodeId, selector: sel }, undefined, 4000).catch(() => null)) as { nodeId?: number } | null;
+                  if (qRes?.nodeId) return qRes.nodeId;
+                }
               }
             } catch {}
             return 0;
           };
 
           const fbDispatchEvents = async () => {
-            await cdpSend(activeWs, 'Runtime.evaluate', {
-              expression: `
-                (function() {
-                  var inputs = document.querySelectorAll('input[type="file"], input[accept*="video"]');
-                  inputs.forEach(function(i) {
-                    i.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-                    i.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-                  });
-                })()
-              `,
-            }).catch(() => {});
+            await safeEvaluate(`
+              (function() {
+                var inputs = document.querySelectorAll('input[type="file"], input[accept*="video"]');
+                inputs.forEach(function(i) {
+                  i.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                  i.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                });
+              })()
+            `, 6000, false);
           };
 
-          // 2. Polling para encontrar input[type="file"] no Facebook
+          // 2. Polling para encontrar input[type="file"] no Facebook Reels
           notify(plat, 'uploading', 45, 'Localizando seletor de Reels do Facebook...');
-          await cdpSend(activeWs, 'DOM.enable');
+          await cdpSend(activeWs, 'DOM.enable', undefined, undefined, 5000).catch(() => {});
           let fbFileNodeId = 0;
-          for (let attempt = 0; attempt < 30; attempt++) {
+          for (let attempt = 0; attempt < 35; attempt++) {
             await new Promise((r) => setTimeout(r, 1200));
+            await dismissFacebookPopups();
             fbFileNodeId = await fbLocateFileInput();
             if (fbFileNodeId) break;
           }
@@ -10615,7 +12109,7 @@ ipcMain.handle('auto-publish-video', async (event, {
           await cdpSend(activeWs, 'DOM.setFileInputFiles', {
             nodeId: fbFileNodeId,
             files: [actualUploadPath],
-          });
+          }, undefined, 15000);
 
           await fbDispatchEvents();
 
@@ -10627,208 +12121,406 @@ ipcMain.handle('auto-publish-video', async (event, {
           let descFilled = false;
           let stepCount = 0;
 
-          for (let wizardCycle = 0; wizardCycle < 60; wizardCycle++) {
+          for (let wizardCycle = 0; wizardCycle < 100; wizardCycle++) {
             await new Promise((r) => setTimeout(r, 1500));
+            if (wizardCycle % 5 === 0) await dismissFacebookPopups();
 
-            const cycleRes = (await cdpSend(activeWs, 'Runtime.evaluate', {
-              expression: `
+            const cycleRes = await safeEvaluate(`
+              (function() {
+                var nextTerms = ['avançar', 'avancar', 'seguinte', 'próximo', 'proximo', 'continuar', 'next', 'siguiente'];
+                var pubTerms = [
+                  'publicar', 'publicar agora', 'partilhar', 'partilhar agora',
+                  'publish', 'publish now', 'share now', 'postar', 'post', 'post now',
+                  'share', 'partilhar reel', 'publicar reel', 'share reel', 'post reel'
+                ];
+                var badTerms = [
+                  'voltar', 'anterior', 'back', 'atrás', 'atras', 'cancelar', 'cancel',
+                  'substitua', 'substituir', 'replace', 'fechar', 'close',
+                  'reproduzir', 'pausar', 'play', 'pause', 'som', 'silenciar', 'mute',
+                  'ajuda', 'help', 'eliminar', 'delete', 'follow', 'seguir', 'like', 'react', 'comment',
+                  'previous', 'next card', 'previous card', 'next items', 'previous items',
+                  'search', 'pesquisar', 'trim video', 'closed captions', 'audio description', 'text transcript', 'music',
+                  'schedule', 'schedule for later', 'agendar', 'agendar para depois', 'programar', 'scheduling',
+                  'audience', 'audiência', 'audiencia', 'remixing', 'remix', 'playlist', 'boost post',
+                  'share to groups', 'share to story', 'partilhar em grupos', 'partilhar no story',
+                  'draft', 'rascunho', 'save as draft', 'guardar como rascunho', 'salvar como rascunho'
+                ];
+
+                function isIgnored(t) {
+                  if (!t) return false;
+                  for (var b = 0; b < badTerms.length; b++) {
+                    if (t === badTerms[b] || t.includes(badTerms[b])) return true;
+                  }
+                  return false;
+                }
+
+                function isNextMatch(t, a) {
+                  if (isIgnored(t) || isIgnored(a)) return false;
+                  for (var i = 0; i < nextTerms.length; i++) {
+                    var term = nextTerms[i];
+                    if (t === term || a === term || t.startsWith(term + ' ') || a.startsWith(term + ' ') || t.startsWith(term + '\\n')) return true;
+                  }
+                  return false;
+                }
+
+                function isPubMatch(t, a) {
+                  if (isIgnored(t) || isIgnored(a)) return false;
+                  for (var i = 0; i < pubTerms.length; i++) {
+                    var term = pubTerms[i];
+                    if (t === term || a === term || t === term + ' reel' || a === term + ' reel' || t.startsWith(term + '\\n') || a.startsWith(term + '\\n')) return true;
+                  }
+                  return false;
+                }
+
+                function isElDisabled(el) {
+                  if (el.disabled) return true;
+                  if (el.getAttribute('aria-disabled') === 'true') return true;
+                  var cls = typeof el.className === 'string' ? el.className.toLowerCase() : '';
+                  if (cls.includes('disabled') || cls.includes('is-disabled')) return true;
+                  var cs = window.getComputedStyle(el);
+                  if (cs && (cs.pointerEvents === 'none' || cs.opacity === '0' || cs.opacity === '0.4' || cs.opacity === '0.5')) return true;
+                  return false;
+                }
+
+                // 1. Localizar campo de descrição / legenda (em qualquer container visível)
+                var descSelectors = [
+                  'div[contenteditable="true"][role="textbox"]',
+                  'div[contenteditable="true"][data-lexical-editor="true"]',
+                  'div[aria-label*="describe" i]',
+                  'div[aria-label*="description" i]',
+                  'div[aria-label*="descrição" i]',
+                  'div[aria-label*="legenda" i]',
+                  'div[aria-label*="escreva" i]',
+                  'div[aria-label*="write" i]',
+                  'textarea[placeholder*="reel" i]',
+                  'textarea[placeholder*="descrição" i]',
+                  'textarea[placeholder*="describe" i]',
+                  'div[contenteditable="true"]'
+                ];
+                var descBox = null;
+                for (var s = 0; s < descSelectors.length; s++) {
+                  var founds = document.querySelectorAll(descSelectors[s]);
+                  for (var f = 0; f < founds.length; f++) {
+                    var el = founds[f];
+                    if (el.offsetParent !== null || el.getBoundingClientRect().width > 0) {
+                      descBox = el;
+                      break;
+                    }
+                  }
+                  if (descBox) break;
+                }
+
+                // 2. Varrer botões em toda a página (suportando tanto div[role="main"] quanto modais)
+                var allButtons = Array.from(document.querySelectorAll('div[role="button"], button, a[role="button"]')).filter(function(b) {
+                  return b.offsetParent !== null || b.getBoundingClientRect().width > 0;
+                });
+
+                var nextBtn = null;
+                var pubBtn = null;
+
+                for (var i = 0; i < allButtons.length; i++) {
+                  var b = allButtons[i];
+                  if (b.getAttribute('role') === 'radio' || b.getAttribute('role') === 'switch' || b.hasAttribute('aria-checked')) continue;
+                  var bt = (b.innerText || b.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+                  var ba = (b.getAttribute('aria-label') || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+
+                  if (!nextBtn && isNextMatch(bt, ba)) {
+                    nextBtn = b;
+                  }
+
+                  if (!pubBtn && isPubMatch(bt, ba)) {
+                    // Evitar contadores numéricos do feed (ex: "4 share", "1.5K share")
+                    if (!/^\\d/.test(bt)) {
+                      pubBtn = b;
+                    }
+                  }
+                }
+
+                return {
+                  hasDesc: !!descBox,
+                  hasNext: !!nextBtn,
+                  nextDisabled: nextBtn ? isElDisabled(nextBtn) : null,
+                  nextText: nextBtn ? ((nextBtn.innerText || nextBtn.getAttribute('aria-label') || '').trim()) : '',
+                  hasPub: !!pubBtn,
+                  pubDisabled: pubBtn ? isElDisabled(pubBtn) : null,
+                  pubText: pubBtn ? ((pubBtn.innerText || pubBtn.getAttribute('aria-label') || '').trim()) : ''
+                };
+              })()
+            `, 12000, true);
+
+            const state = cycleRes?.result?.value;
+            if (!state) {
+              console.log(`[FACEBOOK AUTO] Ciclo ${wizardCycle}: aguardando resposta da interface...`);
+              continue;
+            }
+
+            console.log(`[FACEBOOK AUTO] Ciclo ${wizardCycle}: desc=${state.hasDesc}, next=${state.hasNext}(${state.nextText}), pub=${state.hasPub}(${state.pubText})`);
+
+            // Se a descrição já foi preenchida ou se o botão de publicação está presente,
+            // garantir que está selecionado "Publicar agora" (e NÃO "Agendar" com calendário/hora adiantada)
+            if (descFilled || state?.hasPub) {
+              // PASSO 1: Fechar modal de agendamento se estiver aberto (dialog com "Scheduling options" / "Opções de agendamento")
+              const modalDismissed = await safeEvaluate(`
                 (function() {
-                  // 1. Localizar estritamente o container do assistente de Reels (modal ou dialog)
-                  function getReelsContainer() {
-                    var dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
-                    for (var i = 0; i < dialogs.length; i++) {
-                      var d = dialogs[i];
-                      var txt = (d.innerText || d.textContent || '').toLowerCase();
-                      if (
-                        txt.includes('criar reel') || txt.includes('create reel') ||
-                        txt.includes('substitua o vídeo') || txt.includes('substitua o video') ||
-                        txt.includes('adicionar vídeo') || txt.includes('adicionar video') ||
-                        txt.includes('recortar vídeo') || txt.includes('recortar video') ||
-                        txt.includes('avançar') || txt.includes('seguinte')
-                      ) {
-                        return d;
+                  // Procurar dialogs/modais overlay que contenham texto de agendamento
+                  var dialogs = Array.from(document.querySelectorAll(
+                    'div[role="dialog"], div[aria-modal="true"], div[class*="overlay" i], div[class*="modal" i]'
+                  )).filter(function(d) {
+                    if (!d.offsetParent && d.getBoundingClientRect().width === 0) return false;
+                    var txt = (d.innerText || d.textContent || '').toLowerCase();
+                    return (
+                      txt.includes('scheduling options') || txt.includes('opções de agendamento') ||
+                      txt.includes('schedule for later') || txt.includes('agendar para depois') ||
+                      (txt.includes('schedule') && txt.includes('date') && txt.includes('time')) ||
+                      (txt.includes('agendar') && txt.includes('data') && txt.includes('hora'))
+                    );
+                  });
+
+                  if (dialogs.length === 0) return { found: false };
+
+                  // Encontrar o botão X (fechar) dentro do modal
+                  for (var d = 0; d < dialogs.length; d++) {
+                    var dialog = dialogs[d];
+                    // Tentar aria-label="Close" ou aria-label="Fechar"
+                    var closeBtn = dialog.querySelector(
+                      'div[aria-label="Close"], div[aria-label="Fechar"], ' +
+                      'button[aria-label="Close"], button[aria-label="Fechar"], ' +
+                      'a[aria-label="Close"], a[aria-label="Fechar"], ' +
+                      'div[role="button"][aria-label="Close"], div[role="button"][aria-label="Fechar"]'
+                    );
+                    if (!closeBtn) {
+                      // Tentar SVG com path de X dentro de um role=button
+                      var btns = Array.from(dialog.querySelectorAll('div[role="button"], button'));
+                      for (var b = 0; b < btns.length; b++) {
+                        var btn = btns[b];
+                        var svg = btn.querySelector('svg');
+                        var ariaL = (btn.getAttribute('aria-label') || '').toLowerCase();
+                        var btnText = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                        // É o X se: tem SVG sem texto visível, ou aria-label é close/fechar, ou texto é ×/X
+                        if (svg && (!btnText || btnText === '×' || btnText === 'x')) { closeBtn = btn; break; }
+                        if (ariaL === 'close' || ariaL === 'fechar') { closeBtn = btn; break; }
                       }
                     }
-                    if (dialogs.length > 0) return dialogs[dialogs.length - 1];
-
-                    var main = document.querySelector('div[role="main"], div[data-pagelet*="Reel" i]');
-                    if (main) return main;
-
-                    return document.body;
+                    if (closeBtn) {
+                      try { closeBtn.scrollIntoView({ behavior: 'instant', block: 'center' }); } catch(_) {}
+                      try { closeBtn.focus(); } catch(_) {}
+                      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(ev) {
+                        try { closeBtn.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true, view: window })); } catch(_) {}
+                      });
+                      try { closeBtn.click(); } catch(_) {}
+                      return { found: true, closed: true };
+                    }
                   }
+                  // Se não encontrou o X, clicar em Escape para fechar
+                  try {
+                    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+                    document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+                  } catch(_) {}
+                  return { found: true, closed: false, triedEsc: true };
+                })()
+              `, 6000, true);
 
-                  var container = getReelsContainer();
+              const mVal = modalDismissed?.result?.value;
+              if (mVal?.found) {
+                console.log(`[FACEBOOK AUTO] Modal de agendamento detectado e ${mVal.closed ? 'fechado' : 'tentado fechar'}`);
+                await new Promise((r) => setTimeout(r, 1500));
+                continue; // voltar ao ciclo para re-avaliar a interface sem o modal
+              }
 
-                  var nextTerms = ['avançar', 'avancar', 'seguinte', 'próximo', 'proximo', 'continuar', 'next', 'siguiente'];
-                  var pubTerms = ['publicar', 'publicar agora', 'partilhar', 'partilhar agora', 'publish', 'publish now', 'share now', 'postar'];
-                  var badTerms = [
-                    'voltar', 'anterior', 'back', 'atrás', 'atras', 'cancelar', 'cancel',
-                    'substitua', 'substituir', 'replace', 'fechar', 'close',
-                    'reproduzir', 'pausar', 'play', 'pause', 'som', 'silenciar', 'mute',
-                    'ajuda', 'help', 'eliminar', 'delete'
+              // PASSO 2: Se não há modal overlay, verificar radio/switch de agendamento inline
+              await safeEvaluate(`
+                (function() {
+                  // Verificar se campos de data/hora de agendamento estão visíveis na tela
+                  var dateInputs = Array.from(document.querySelectorAll(
+                    'input[type="date"], input[type="time"], input[type="datetime-local"], ' +
+                    'input[aria-label*="data" i], input[aria-label*="date" i], ' +
+                    'input[aria-label*="hora" i], input[aria-label*="time" i]'
+                  )).filter(function(i) {
+                    return i.offsetParent !== null && i.getBoundingClientRect().width > 0;
+                  });
+
+                  // Verificar se há opção/switch de agendamento marcado como ativo
+                  var scheduleActive = Array.from(document.querySelectorAll(
+                    'div[role="radio"], div[role="switch"], input[type="radio"], input[type="checkbox"]'
+                  )).find(function(el) {
+                    var isChecked = el.getAttribute('aria-checked') === 'true' || el.checked === true;
+                    if (!isChecked) return false;
+                    var t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').toLowerCase();
+                    return t.includes('agendar') || t.includes('schedule') || t.includes('programar');
+                  });
+
+                  if (dateInputs.length > 0 || scheduleActive) {
+                    console.log('[FACEBOOK AUTO] Agendamento ativo detectado. Alternando para "Publicar agora"...');
+
+                    // Se for switch ligado, desligar
+                    if (scheduleActive && (scheduleActive.getAttribute('role') === 'switch' || scheduleActive.type === 'checkbox')) {
+                      try { scheduleActive.click(); return { changed: true }; } catch(_) {}
+                    }
+
+                    // Se for rádio ou opção, procurar o botão/rádio de "Publicar agora" / "Partilhar agora"
+                    var nowOptions = Array.from(document.querySelectorAll(
+                      'div[role="radio"], input[type="radio"], label, div[role="button"], span'
+                    )).filter(function(el) {
+                      if (!el.offsetParent && el.getBoundingClientRect().width === 0) return false;
+                      var t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                      return (
+                        t === 'publicar agora' || t === 'partilhar agora' ||
+                        t === 'publish now' || t === 'share now' ||
+                        t.startsWith('publicar agora') || t.startsWith('partilhar agora') ||
+                        t.startsWith('publish now') || t.startsWith('share now')
+                      ) && !t.includes('agendar') && !t.includes('schedule');
+                    });
+
+                    for (var i = 0; i < nowOptions.length; i++) {
+                      try {
+                        nowOptions[i].click();
+                        return { changed: true };
+                      } catch(_) {}
+                    }
+                  }
+                  return { changed: false };
+                })()
+              `, 6000, false);
+            }
+
+            // A. Se o campo de descrição for visível e ainda não preenchido:
+            if (state?.hasDesc && !descFilled) {
+              notify(plat, 'captioning', 84, 'Preenchendo descrição e hashtags do Reel...');
+              
+              const fillFbDescScript = `
+                (function(text) {
+                  var descSelectors = [
+                    'div[contenteditable="true"][role="textbox"]',
+                    'div[contenteditable="true"][data-lexical-editor="true"]',
+                    'div[aria-label*="describe" i]',
+                    'div[aria-label*="description" i]',
+                    'div[aria-label*="descrição" i]',
+                    'div[aria-label*="legenda" i]',
+                    'div[aria-label*="escreva" i]',
+                    'div[aria-label*="write" i]',
+                    'textarea[placeholder*="reel" i]',
+                    'textarea[placeholder*="descrição" i]',
+                    'textarea[placeholder*="describe" i]',
+                    'div[contenteditable="true"]'
                   ];
-
-                  function isIgnored(t) {
-                    for (var b = 0; b < badTerms.length; b++) {
-                      if (t.includes(badTerms[b])) return true;
-                    }
-                    return false;
-                  }
-
-                  function matchTerms(text, terms) {
-                    if (!text || isIgnored(text)) return false;
-                    for (var i = 0; i < terms.length; i++) {
-                      var term = terms[i];
-                      if (text === term || text.startsWith(term + ' ') || text.startsWith(term + '\\n')) return true;
-                    }
-                    return false;
-                  }
-
-                  function isElDisabled(el) {
-                    if (el.disabled) return true;
-                    if (el.getAttribute('aria-disabled') === 'true') return true;
-                    var cls = typeof el.className === 'string' ? el.className.toLowerCase() : '';
-                    if (cls.includes('disabled')) return true;
-                    var cs = window.getComputedStyle(el);
-                    if (cs && (cs.pointerEvents === 'none' || cs.opacity === '0')) return true;
-                    return false;
-                  }
-
-                  // 2. Verificar campo de descrição / legenda ESTRITAMENTE dentro do container de Reels
-                  var descBox = container.querySelector(
-                    'div[contenteditable="true"][role="textbox"], ' +
-                    'div[contenteditable="true"][data-lexical-editor="true"], ' +
-                    'div[contenteditable="true"], ' +
-                    'textarea[placeholder*="reel" i], ' +
-                    'textarea[placeholder*="descrição" i], ' +
-                    'textarea[placeholder*="legenda" i], ' +
-                    'div[aria-label*="descrição" i], ' +
-                    'div[aria-label*="description" i], ' +
-                    'div[aria-label*="escreva" i], ' +
-                    'div[aria-label*="write" i]'
-                  );
-
-                  // 3. Buscar botões ESTRITAMENTE dentro do container de Reels (nunca no feed de fundo!)
-                  var buttons = Array.from(container.querySelectorAll('div[role="button"], button, a[role="button"]'));
-
-                  // Botão Avançar / Seguinte
-                  var nextBtn = null;
-                  for (var n = 0; n < buttons.length; n++) {
-                    var nb = buttons[n];
-                    var nt = (nb.innerText || nb.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
-                    var na = (nb.getAttribute('aria-label') || '').trim().toLowerCase().replace(/\\s+/g, ' ');
-                    if (matchTerms(nt, nextTerms) || matchTerms(na, nextTerms)) {
-                      nextBtn = nb;
-                      break;
-                    }
-                  }
-
-                  // Botão Publicar / Partilhar
-                  var pubBtn = null;
-                  for (var p = 0; p < buttons.length; p++) {
-                    var pb = buttons[p];
-                    var pt = (pb.innerText || pb.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
-                    var pa = (pb.getAttribute('aria-label') || '').trim().toLowerCase().replace(/\\s+/g, ' ');
-                    if (matchTerms(pt, pubTerms) || matchTerms(pa, pubTerms)) {
-                      pubBtn = pb;
-                      break;
-                    }
-                  }
-
-                  // Se estiver na etapa com descrição, mas o botão ainda tem outro texto (ex: botão primário azul no rodapé)
-                  if (descBox && !pubBtn) {
-                    for (var b = 0; b < buttons.length; b++) {
-                      var bEl = buttons[b];
-                      var bText = (bEl.innerText || bEl.textContent || '').trim().toLowerCase();
-                      if (!isIgnored(bText) && (matchTerms(bText, pubTerms) || matchTerms(bText, nextTerms))) {
-                        pubBtn = bEl;
+                  var descBox = null;
+                  for (var s = 0; s < descSelectors.length; s++) {
+                    var founds = document.querySelectorAll(descSelectors[s]);
+                    for (var f = 0; f < founds.length; f++) {
+                      var el = founds[f];
+                      if (el.offsetParent !== null || el.getBoundingClientRect().width > 0) {
+                        descBox = el;
                         break;
                       }
                     }
+                    if (descBox) break;
                   }
+                  if (!descBox) return false;
+                  try { descBox.focus(); } catch(_) {}
 
-                  return {
-                    hasContainer: !!container,
-                    hasDesc: !!descBox,
-                    hasNext: !!nextBtn,
-                    nextDisabled: nextBtn ? isElDisabled(nextBtn) : null,
-                    nextText: nextBtn ? (nextBtn.innerText || '').trim() : '',
-                    hasPub: !!pubBtn,
-                    pubDisabled: pubBtn ? isElDisabled(pubBtn) : null,
-                    pubText: pubBtn ? (pubBtn.innerText || '').trim() : ''
-                  };
-                })()
-              `,
-              returnByValue: true,
-            })) as {
-              result?: {
-                value?: {
-                  hasContainer: boolean;
-                  hasDesc: boolean;
-                  hasNext: boolean;
-                  nextDisabled: boolean | null;
-                  nextText: string;
-                  hasPub: boolean;
-                  pubDisabled: boolean | null;
-                  pubText: string;
-                };
-              };
-            };
+                  if (descBox.isContentEditable) {
+                    try {
+                      var sel = window.getSelection();
+                      var range = document.createRange();
+                      range.selectNodeContents(descBox);
+                      sel.removeAllRanges();
+                      sel.addRange(range);
+                      document.execCommand('delete', false, null);
+                      document.execCommand('insertText', false, text);
+                    } catch(_) {
+                      descBox.innerText = text;
+                    }
+                  } else {
+                    descBox.value = text;
+                  }
+                  descBox.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                  descBox.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                  return true;
+                })(${JSON.stringify(fullText)})
+              `;
 
-            const state = cycleRes?.result?.value;
+              const fillRes: any = await safeEvaluate(fillFbDescScript, 10000, true);
 
-            // REGRA FUNDAMENTAL: Se o botão "Avançar" / "Seguinte" estiver presente e NÃO houver campo de descrição,
-            // estamos categoricamente na Etapa 1 ou Etapa 2!
-            if (state?.hasNext && !state?.hasDesc) {
+              if (!fillRes?.result?.value) {
+                try {
+                  await typeHumanCdp(fullText, activeWs);
+                } catch (_) {
+                  await cdpSend(activeWs, 'Input.insertText', { text: fullText }, undefined, 5000).catch(() => {});
+                }
+              }
+
+              descFilled = true;
+              console.log('[FACEBOOK AUTO] Descrição e hashtags preenchidas com sucesso!');
+              await new Promise((r) => setTimeout(r, 1500));
+              continue;
+            }
+
+            // B. Se o botão "Avançar" / "Seguinte" / "Next" estiver presente:
+            if (state?.hasNext && (!state?.hasDesc || descFilled)) {
               if (state.nextDisabled === false) {
                 stepCount++;
                 notify(plat, 'captioning', 74 + Math.min(stepCount * 5, 12), `Avançando etapa (${state.nextText || 'Avançar'})...`);
                 
-                // Clicar e obter coordenadas no DOM
-                const clickNextRes = (await cdpSend(activeWs, 'Runtime.evaluate', {
-                  expression: `
-                    (function() {
-                      var dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
-                      var container = dialogs.length > 0 ? dialogs[dialogs.length - 1] : document.body;
-                      var nextTerms = ['avançar', 'avancar', 'seguinte', 'próximo', 'proximo', 'continuar', 'next', 'siguiente'];
-                      var badTerms = ['voltar', 'anterior', 'back', 'atrás', 'atras', 'cancelar', 'substitua', 'substituir', 'fechar', 'close'];
+                const clickNextRes = await safeEvaluate(`
+                  (function() {
+                    var nextTerms = ['avançar', 'avancar', 'seguinte', 'próximo', 'proximo', 'continuar', 'next', 'siguiente'];
+                    var badTerms = [
+                      'voltar', 'anterior', 'back', 'atrás', 'atras', 'cancelar', 'cancel',
+                      'substitua', 'substituir', 'fechar', 'close', 'next card', 'previous card', 'next items', 'previous items',
+                      'trim video', 'closed captions', 'audio description', 'text transcript', 'music',
+                      'schedule', 'schedule for later', 'agendar', 'agendar para depois', 'programar', 'scheduling',
+                      'audience', 'audiência', 'audiencia', 'remixing', 'remix', 'playlist', 'boost post',
+                      'share to groups', 'share to story', 'partilhar em grupos', 'partilhar no story',
+                      'draft', 'rascunho', 'save as draft', 'guardar como rascunho', 'salvar como rascunho'
+                    ];
 
-                      function isIgnored(t) {
-                        for (var b = 0; b < badTerms.length; b++) { if (t.includes(badTerms[b])) return true; }
-                        return false;
+                    function isIgnored(t) {
+                      if (!t) return false;
+                      for (var b = 0; b < badTerms.length; b++) { if (t === badTerms[b] || t.includes(badTerms[b])) return true; }
+                      return false;
+                    }
+                    function isNextMatch(t, a) {
+                      if (isIgnored(t) || isIgnored(a)) return false;
+                      for (var i = 0; i < nextTerms.length; i++) {
+                        var term = nextTerms[i];
+                        if (t === term || a === term || t.startsWith(term + ' ') || a.startsWith(term + ' ') || t.startsWith(term + '\\n')) return true;
                       }
-                      function matchTerms(text, terms) {
-                        if (!text || isIgnored(text)) return false;
-                        for (var i = 0; i < terms.length; i++) {
-                          if (text === terms[i] || text.startsWith(terms[i] + ' ') || text.startsWith(terms[i] + '\\n')) return true;
-                        }
-                        return false;
-                      }
+                      return false;
+                    }
 
-                      var buttons = Array.from(container.querySelectorAll('div[role="button"], button, a[role="button"]'));
-                      for (var i = 0; i < buttons.length; i++) {
-                        var nb = buttons[i];
-                        var nt = (nb.innerText || nb.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
-                        var na = (nb.getAttribute('aria-label') || '').trim().toLowerCase().replace(/\\s+/g, ' ');
-                        if (matchTerms(nt, nextTerms) || matchTerms(na, nextTerms)) {
-                          var disabled = nb.getAttribute('aria-disabled') === 'true' || nb.disabled;
-                          if (!disabled) {
-                            var rect = nb.getBoundingClientRect();
-                            nb.click();
-                            return { clicked: true, text: nt || na, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-                          }
+                    var allButtons = Array.from(document.querySelectorAll('div[role="button"], button, a[role="button"]'));
+                    for (var i = 0; i < allButtons.length; i++) {
+                      var nb = allButtons[i];
+                      if (!nb.offsetParent && nb.getBoundingClientRect().width === 0) continue;
+                      var nt = (nb.innerText || nb.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+                      var na = (nb.getAttribute('aria-label') || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+                      if (isNextMatch(nt, na)) {
+                        var disabled = nb.getAttribute('aria-disabled') === 'true' || nb.disabled;
+                        if (!disabled) {
+                          try { nb.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' }); } catch(_) {}
+                          try { nb.focus(); } catch(_) {}
+                          ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(ev) {
+                            try { nb.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true, view: window })); } catch(_) {}
+                          });
+                          try { nb.click(); } catch(_) {}
+                          var rect = nb.getBoundingClientRect();
+                          return { clicked: true, text: nt || na, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
                         }
                       }
-                      return { clicked: false };
-                    })()
-                  `,
-                  returnByValue: true,
-                })) as { result?: { value?: { clicked: boolean; text?: string; x?: number; y?: number } } };
+                    }
+                    return { clicked: false };
+                  })()
+                `, 10000, true);
 
                 const nVal = clickNextRes?.result?.value;
                 if (nVal?.clicked && nVal.x && nVal.y && nVal.x > 0 && nVal.y > 0) {
-                  await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: nVal.x, y: nVal.y, button: 'left', clickCount: 1 }).catch(() => {});
-                  await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: nVal.x, y: nVal.y, button: 'left', clickCount: 1 }).catch(() => {});
+                  const cx = Math.round(nVal.x);
+                  const cy = Math.round(nVal.y);
+                  await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy }, undefined, 3000).catch(() => {});
+                  await new Promise((r) => setTimeout(r, 60));
+                  await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1 }, undefined, 3000).catch(() => {});
+                  await new Promise((r) => setTimeout(r, 100));
+                  await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 }, undefined, 3000).catch(() => {});
                 }
 
                 console.log(`[FACEBOOK AUTO] Avançada etapa ${stepCount} com "${state.nextText}"`);
@@ -10839,143 +12531,69 @@ ipcMain.handle('auto-publish-video', async (event, {
               continue;
             }
 
-            // Se o campo de descrição for visível e ainda não preenchido (Etapa 3 - Final):
-            if (state?.hasDesc && !descFilled) {
-              notify(plat, 'captioning', 84, 'Preenchendo descrição e hashtags do Reel (digitação humanizada)...');
-              
-              // Passo: Focar o container e limpar antes de digitar
-              const focusFbDesc = `
-                (function() {
-                  var dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
-                  var container = dialogs.length > 0 ? dialogs[dialogs.length - 1] : document.body;
-                  var descBox = container.querySelector(
-                    'div[contenteditable="true"][role="textbox"], ' +
-                    'div[contenteditable="true"][data-lexical-editor="true"], ' +
-                    'div[contenteditable="true"], ' +
-                    'textarea[placeholder*="reel" i], ' +
-                    'div[aria-label*="descrição" i], ' +
-                    'div[aria-label*="description" i], ' +
-                    'div[aria-label*="escreva" i], ' +
-                    'div[aria-label*="write" i]'
-                  );
-                  if (!descBox) return false;
-                  try { descBox.focus(); } catch(_) {}
-                  try {
-                    var sel = window.getSelection();
-                    var range = document.createRange();
-                    range.selectNodeContents(descBox);
-                    sel.removeAllRanges();
-                    sel.addRange(range);
-                  } catch(_) {}
-                  return true;
-                })()
-              `;
-              const fbFocused = await cdpSend(activeWs, 'Runtime.evaluate', { expression: focusFbDesc, returnByValue: true }).catch(() => null) as any;
-              await new Promise((r) => setTimeout(r, 400));
-
-              try {
-                if (fbFocused?.result?.value === true) {
-                  await typeHumanCdp(fullText, activeWs);
-                } else {
-                  throw new Error('fb-box-not-found');
-                }
-              } catch (_) {
-                // Fallback robusto via DOM + execCommand + Input.insertText
-                await cdpSend(activeWs, 'Runtime.evaluate', {
-                  expression: `
-                    (function(text) {
-                      var dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
-                      var container = dialogs.length > 0 ? dialogs[dialogs.length - 1] : document.body;
-                      var descBox = container.querySelector(
-                        'div[contenteditable="true"][role="textbox"], ' +
-                        'div[contenteditable="true"][data-lexical-editor="true"], ' +
-                        'div[contenteditable="true"], ' +
-                        'textarea[placeholder*="reel" i], ' +
-                        'div[aria-label*="descrição" i], ' +
-                        'div[aria-label*="description" i], ' +
-                        'div[aria-label*="escreva" i], ' +
-                        'div[aria-label*="write" i]'
-                      );
-                      if (!descBox) return false;
-                      try { descBox.focus(); } catch(_) {}
-                      if (descBox.isContentEditable) {
-                        try {
-                          var sel = window.getSelection();
-                          var range = document.createRange();
-                          range.selectNodeContents(descBox);
-                          sel.removeAllRanges();
-                          sel.addRange(range);
-                        } catch(_) {}
-                        var execOk = false;
-                        try { execOk = document.execCommand('insertText', false, text); } catch(_) {}
-                        if (!execOk || !descBox.innerText.includes(text.slice(0, 10))) { descBox.innerText = text; }
-                      } else {
-                        descBox.value = text;
-                      }
-                      descBox.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-                      descBox.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-                      return true;
-                    })(${JSON.stringify(fullText)})
-                  `,
-                });
-                try { await cdpSend(activeWs, 'Input.insertText', { text: fullText }); } catch (_) {}
-              }
-
-              descFilled = true;
-              console.log('[FACEBOOK AUTO] Descrição e hashtags preenchidas com sucesso!');
-              await new Promise((r) => setTimeout(r, 1500));
-              continue;
-            }
-
-            // Se o botão de Publicar / Partilhar estiver na tela (Etapa Final):
+            // C. Se o botão de Publicar / Partilhar / Publish / Share estiver presente (Etapa Final):
             if (state?.hasPub) {
               if (state.pubDisabled === false) {
-                // Pausa humanizada de revisão antes de publicar no Facebook (2-4 segundos simulando leitura humana)
-                const reviewPauseFb = Math.floor(Math.random() * 2000) + 2000;
+                const reviewPauseFb = Math.floor(Math.random() * 2000) + 1500;
                 notify(plat, 'publishing', 88, `Revisando publicação antes de confirmar (${Math.round(reviewPauseFb / 1000)}s)...`);
                 await new Promise((r) => setTimeout(r, reviewPauseFb));
 
                 notify(plat, 'publishing', 90, `Acionando "${state.pubText || 'Publicar'}" no Facebook Reels...`);
-                const clickPubRes = (await cdpSend(activeWs, 'Runtime.evaluate', {
-                  expression: `
-                    (function() {
-                      var dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
-                      var container = dialogs.length > 0 ? dialogs[dialogs.length - 1] : document.body;
+                const clickPubRes = await safeEvaluate(`
+                  (function() {
+                    var pubTerms = [
+                      'publicar', 'publicar agora', 'partilhar', 'partilhar agora',
+                      'publish', 'publish now', 'share now', 'postar', 'post', 'post now',
+                      'share', 'partilhar reel', 'publicar reel', 'share reel', 'post reel'
+                    ];
+                    var badTerms = [
+                      'voltar', 'anterior', 'back', 'atrás', 'atras', 'cancelar', 'cancel',
+                      'substitua', 'substituir', 'fechar', 'close', 'next card', 'previous card', 'next items', 'previous items',
+                      'schedule', 'schedule for later', 'agendar', 'agendar para depois', 'programar', 'scheduling',
+                      'audience', 'audiência', 'audiencia', 'remixing', 'remix', 'playlist', 'boost post',
+                      'share to groups', 'share to story', 'partilhar em grupos', 'partilhar no story',
+                      'draft', 'rascunho', 'save as draft', 'guardar como rascunho', 'salvar como rascunho'
+                    ];
 
-                      var pubTerms = ['publicar', 'publicar agora', 'partilhar', 'partilhar agora', 'publish', 'publish now', 'share now', 'postar'];
-                      var badTerms = ['voltar', 'anterior', 'back', 'atrás', 'atras', 'cancelar', 'substitua', 'substituir', 'fechar', 'close'];
-
-                      function isIgnored(t) {
-                        for (var b = 0; b < badTerms.length; b++) { if (t.includes(badTerms[b])) return true; }
-                        return false;
+                    function isIgnored(t) {
+                      if (!t) return false;
+                      for (var b = 0; b < badTerms.length; b++) { if (t === badTerms[b] || t.includes(badTerms[b])) return true; }
+                      return false;
+                    }
+                    function isPubMatch(t, a) {
+                      if (isIgnored(t) || isIgnored(a)) return false;
+                      for (var i = 0; i < pubTerms.length; i++) {
+                        var term = pubTerms[i];
+                        if (t === term || a === term || t === term + ' reel' || a === term + ' reel' || t.startsWith(term + '\\n') || a.startsWith(term + '\\n')) return true;
                       }
-                      function matchTerms(text, terms) {
-                        if (!text || isIgnored(text)) return false;
-                        for (var i = 0; i < terms.length; i++) {
-                          if (text === terms[i] || text.startsWith(terms[i] + ' ') || text.startsWith(terms[i] + '\\n')) return true;
+                      return false;
+                    }
+
+                    var allButtons = Array.from(document.querySelectorAll('div[role="button"], button, a[role="button"]'));
+                    for (var i = 0; i < allButtons.length; i++) {
+                      var pb = allButtons[i];
+                      if (!pb.offsetParent && pb.getBoundingClientRect().width === 0) continue;
+                      if (pb.getAttribute('role') === 'radio' || pb.getAttribute('role') === 'switch' || pb.hasAttribute('aria-checked')) continue;
+                      var pt = (pb.innerText || pb.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+                      var pa = (pb.getAttribute('aria-label') || '').trim().toLowerCase().replace(/\\s+/g, ' ');
+                      if (isPubMatch(pt, pa)) {
+                        if (/^\\d/.test(pt)) continue; // Ignorar contadores de feed
+                        var disabled = pb.getAttribute('aria-disabled') === 'true' || pb.disabled;
+                        if (!disabled) {
+                          try { pb.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' }); } catch(_) {}
+                          try { pb.focus(); } catch(_) {}
+                          ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function(ev) {
+                            try { pb.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, composed: true, view: window })); } catch(_) {}
+                          });
+                          try { pb.click(); } catch(_) {}
+                          var rect = pb.getBoundingClientRect();
+                          return { clicked: true, text: pt || pa, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
                         }
-                        return false;
                       }
-
-                      var buttons = Array.from(container.querySelectorAll('div[role="button"], button, a[role="button"]'));
-                      for (var i = 0; i < buttons.length; i++) {
-                        var pb = buttons[i];
-                        var pt = (pb.innerText || pb.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
-                        var pa = (pb.getAttribute('aria-label') || '').trim().toLowerCase().replace(/\\s+/g, ' ');
-                        if (matchTerms(pt, pubTerms) || matchTerms(pa, pubTerms)) {
-                          var disabled = pb.getAttribute('aria-disabled') === 'true' || pb.disabled;
-                          if (!disabled) {
-                            var rect = pb.getBoundingClientRect();
-                            pb.click();
-                            return { clicked: true, text: pt || pa, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-                          }
-                        }
-                      }
-                      return { clicked: false };
-                    })()
-                  `,
-                  returnByValue: true,
-                })) as { result?: { value?: { clicked: boolean; text?: string; x?: number; y?: number } } };
+                    }
+                    return { clicked: false };
+                  })()
+                `, 10000, true);
 
                 const pVal = clickPubRes?.result?.value;
                 if (pVal?.clicked) {
@@ -10992,24 +12610,83 @@ ipcMain.handle('auto-publish-video', async (event, {
 
           // Despacho de clique físico via CDP se obtidas coordenadas
           if (pubCoords && pubCoords.x > 0) {
-            await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: pubCoords.x, y: pubCoords.y, button: 'left', clickCount: 1 }).catch(() => {});
-            await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: pubCoords.x, y: pubCoords.y, button: 'left', clickCount: 1 }).catch(() => {});
+            const px = Math.round(pubCoords.x);
+            const py = Math.round(pubCoords.y);
+            await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: px, y: py }, undefined, 3000).catch(() => {});
+            await new Promise((r) => setTimeout(r, 60));
+            await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: px, y: py, button: 'left', clickCount: 1 }, undefined, 3000).catch(() => {});
+            await new Promise((r) => setTimeout(r, 100));
+            await cdpSend(activeWs, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: px, y: py, button: 'left', clickCount: 1 }, undefined, 3000).catch(() => {});
           }
 
           if (!pubClicked) {
             throw new Error('O botão "Publicar" no Facebook Reels permaneceu inativo ou não foi localizado após o preenchimento.');
           }
 
-          // 5. Confirmação Real e Estrita do Facebook (Sem falsos positivos!)
+          // 5. Confirmação Real e Estrita do Facebook (incluindo tratamento de modais pós-clique)
           notify(plat, 'publishing', 93, 'Upload enviado! Aguardando confirmação oficial do Facebook...');
           let fbConfirmed = false;
 
-          for (let conf = 0; conf < 50; conf++) {
+          for (let conf = 0; conf < 60; conf++) {
             await new Promise((r) => setTimeout(r, 2000));
+
+            // Tratar possível modal de confirmação pós-clique ("Quem pode ver os reels", "Confirmar", "Concluído", "Público", "Partilhar")
+            await safeEvaluate(`
+              (function() {
+                var postModals = document.querySelectorAll('div[role="dialog"], div[aria-modal="true"]');
+                for (var m = 0; m < postModals.length; m++) {
+                  var mEl = postModals[m];
+                  var mTxt = (mEl.innerText || '').toLowerCase();
+                  if (
+                    mTxt.includes('quem pode ver') || mTxt.includes('who can see') ||
+                    mTxt.includes('público') || mTxt.includes('public') ||
+                    mTxt.includes('concluir') || mTxt.includes('partilhar') ||
+                    mTxt.includes('share') || mTxt.includes('reels') ||
+                    mTxt.includes('ativar') || mTxt.includes('enable') ||
+                    mTxt.includes('guardar') || mTxt.includes('salvar') ||
+                    mTxt.includes('confirmar') || mTxt.includes('confirm')
+                  ) {
+                    var confBtns = mEl.querySelectorAll('button, div[role="button"]');
+                    for (var cb = 0; cb < confBtns.length; cb++) {
+                      var cbt = (confBtns[cb].innerText || '').toLowerCase().trim();
+                      var aria = (confBtns[cb].getAttribute('aria-label') || '').toLowerCase().trim();
+                      if (
+                        cbt === 'concluído' || cbt === 'concluido' || cbt === 'done' ||
+                        cbt === 'confirmar' || cbt === 'confirm' ||
+                        cbt === 'partilhar agora' || cbt === 'share now' ||
+                        cbt === 'publicar' || cbt === 'publish' ||
+                        cbt === 'partilhar' || cbt === 'share' ||
+                        cbt === 'continuar' || cbt === 'continue' ||
+                        cbt === 'ok' || cbt === 'entendi' || cbt === 'got it' ||
+                        aria === 'fechar' || aria === 'close'
+                      ) {
+                        try { confBtns[cb].click(); } catch(_) {}
+                        return true;
+                      }
+                    }
+                  }
+                }
+                return false;
+              })()
+            `, 6000, false);
+
             const checkFbDone = `
               (function() {
                 var bodyText = document.body ? document.body.innerText.toLowerCase() : '';
-                // 1. Mensagens explícitas de confirmação (pt-PT, pt-BR, EN)
+
+                // 1. Verificar se o upload ou processamento ainda está ATIVO
+                var isUploadingActive = (
+                  document.querySelector('[role="progressbar"], [aria-busy="true"], .progress_bar') !== null ||
+                  bodyText.includes('a carregar') ||
+                  bodyText.includes('a enviar') ||
+                  bodyText.includes('uploading') ||
+                  bodyText.includes('a guardar') ||
+                  bodyText.includes('saving') ||
+                  bodyText.includes('publicando') ||
+                  bodyText.includes('a publicar')
+                );
+
+                // 2. Mensagens explícitas de confirmação (pt-PT, pt-BR, EN)
                 if (
                   bodyText.includes('o teu reel foi publicado') ||
                   bodyText.includes('o teu reel foi partilhado') ||
@@ -11019,38 +12696,58 @@ ipcMain.handle('auto-publish-video', async (event, {
                   bodyText.includes('seu reel está sendo processado') ||
                   bodyText.includes('your reel is being published') ||
                   bodyText.includes('your reel has been published') ||
+                  bodyText.includes('your reel was published') ||
+                  bodyText.includes('your reel is being processed') ||
                   bodyText.includes('publicado com sucesso') ||
                   bodyText.includes('partilhado com sucesso') ||
                   bodyText.includes('publicação concluída') ||
-                  bodyText.includes('partilha concluída')
+                  bodyText.includes('partilha concluída') ||
+                  bodyText.includes('a tua publicação foi partilhada') ||
+                  bodyText.includes('a sua publicação foi compartilhada')
                 ) {
                   return { done: true, reason: 'explicit_text' };
                 }
 
-                // 2. O modal do assistente de Reels fechou completamente (após pelo menos 3 ciclos = 6s de envio)
-                var dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'));
-                var hasReelsDialog = dialogs.some(function(d) {
-                  var dt = (d.innerText || d.textContent || '').toLowerCase();
-                  return dt.includes('criar reel') || dt.includes('create reel') || dt.includes('substitua o vídeo') || dt.includes('adicionar vídeo');
-                });
-
-                if (!hasReelsDialog && ${conf} >= 3) {
-                  return { done: true, reason: 'reels_dialog_closed' };
+                // 3. Redirecionamento para fora de /reels/create/ (indica conclusão no Facebook SPA)
+                // Deve ter decorrido pelo menos 3 ciclos (6s) e o upload não pode estar explicitamente em progresso
+                var curPath = window.location.pathname.toLowerCase();
+                if (!curPath.includes('/reels/create') && !isUploadingActive && ${conf} >= 3) {
+                  return { done: true, reason: 'navigated_away_from_composer' };
                 }
 
-                return { done: false };
+                // 4. Se a interface de Reels composer sumiu (sem botão publicar e sem botão avançar e sem campo de descrição),
+                // e o upload ativo terminou, após pelo menos 8 ciclos (16 segundos)
+                var hasComposer = (
+                  document.querySelector('div[contenteditable="true"]') !== null ||
+                  document.querySelector('input[type="file"]') !== null ||
+                  document.querySelector('video') !== null
+                );
+                var hasPubOrNext = Array.from(document.querySelectorAll('div[role="button"], button')).some(function(b) {
+                  var t = (b.innerText || '').trim().toLowerCase();
+                  return t === 'publicar' || t === 'publish' || t === 'partilhar' || t === 'avançar' || t === 'next';
+                });
+
+                if (!hasComposer && !hasPubOrNext && !isUploadingActive && ${conf} >= 8) {
+                  return { done: true, reason: 'composer_dismissed_and_idle' };
+                }
+
+                return { done: false, isUploading: isUploadingActive };
               })()
             `;
-            const fbDoneRes = (await cdpSend(activeWs, 'Runtime.evaluate', { expression: checkFbDone, returnByValue: true })) as {
-              result?: { value?: { done: boolean; reason?: string } };
-            };
+
+            const fbDoneRes = await safeEvaluate(checkFbDone, 8000, true);
 
             if (fbDoneRes?.result?.value?.done) {
               console.log('[FACEBOOK AUTO] Confirmação detectada:', fbDoneRes.result.value.reason);
               fbConfirmed = true;
               break;
             } else {
-              notify(plat, 'publishing', 94, `Facebook finalizando processamento do Reel (${(conf + 1) * 2}s)...`);
+              const isUp = fbDoneRes?.result?.value?.isUploading;
+              if (isUp) {
+                notify(plat, 'publishing', 94, `Facebook enviando/processando vídeo (${(conf + 1) * 2}s)...`);
+              } else {
+                notify(plat, 'publishing', 94, `Facebook finalizando publicação do Reel (${(conf + 1) * 2}s)...`);
+              }
             }
           }
 
@@ -11060,6 +12757,7 @@ ipcMain.handle('auto-publish-video', async (event, {
 
           notify(plat, 'done', 100, 'Publicado e confirmado com sucesso no Facebook Reels da Página!');
           results[plat] = { success: true };
+          if (targetSession) targetSession.isPublishing = false;
         } else if (plat === 'instagram') {
 
           // ── Helper: Re-adquirir WS após navegação (mesmo padrão do Facebook) ──
@@ -11421,14 +13119,15 @@ ipcMain.handle('auto-publish-video', async (event, {
 
         // Fechar a janela do Chrome imediatamente após a confirmação de publicação com sucesso
         if (results[plat]?.success && targetSession) {
-          notify(plat, 'done', 100, `Publicação concluída! Fechando janela do ${plat.toUpperCase()}...`);
-          await new Promise((r) => setTimeout(r, 3500));
+          notify(plat, 'done', 100, `Publicação concluída! Aguardando persistência dos dados e fechando ${plat.toUpperCase()}...`);
+          await new Promise((r) => setTimeout(r, 8000));
           try {
             if (targetSession.ws && targetSession.ws.readyState === WebSocket.OPEN) {
-              try { await cdpSend(targetSession.ws, 'Browser.close'); } catch (_) {}
+              try { await cdpSend(targetSession.ws, 'Browser.close', {}, undefined, 4000); } catch (_) {}
               try { targetSession.ws.close(); } catch (_) {}
             }
           } catch (_) {}
+          await new Promise((r) => setTimeout(r, 2000));
           try {
             if (targetSession.process && !targetSession.process.killed && targetSession.process.pid) {
               targetSession.process.kill();
@@ -11441,6 +13140,7 @@ ipcMain.handle('auto-publish-video', async (event, {
           }
         }
       } catch (platErr: unknown) {
+        if (targetSession) targetSession.isPublishing = false;
         const errStr = platErr instanceof Error ? platErr.message : 'Falha na publicação automática';
         notify(plat, 'error', 0, `Erro ao publicar: ${errStr}`);
         results[plat] = { success: false, error: errStr };

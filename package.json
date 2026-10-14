@@ -1,7 +1,7 @@
 {
   "name": "2am-studio-parceiros",
   "productName": "2AM Studio Parceiros",
-  "version": "1.4.32",
+  "version": "1.4.50",
   "author": "2AM Studio",
   "description": "Plataforma e Agente do Parceiro 2AM Studio",
   "private": true,
@@ -28,7 +28,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "build/icon.ico"
@@ -46,6 +48,17 @@
       "perMachine": false,
       "deleteAppDataOnUninstall": false,
       "differentialPackage": false
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "zip",
+          "arch": ["x64", "arm64"]
+        }
+      ],
+      "icon": "build/icon.png",
+      "category": "public.app-category.business",
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}"
     }
   },
   "dependencies": {

@@ -220,7 +220,13 @@ export const ProfileCard: React.FC<Props> = ({
                     <div className="min-w-0">
                       <div className="flex items-center gap-1.5 flex-wrap">
                         <span className="font-bold text-xs text-[#F5EFE6] truncate">
-                          {acc.username || (acc.platform === 'instagram' ? 'Conta Creator' : 'Canal')}
+                          {(() => {
+                            const isEmail = acc.username && (acc.username.includes('@') && acc.username.includes('.'));
+                            if (isEmail || !acc.username) {
+                              return meta?.name || (acc.platform === 'instagram' ? 'Conta Creator' : acc.platform === 'youtube' ? 'Canal YouTube' : acc.platform === 'facebook' ? 'Página Facebook' : 'Canal TikTok');
+                            }
+                            return acc.username;
+                          })()}
                         </span>
                         <span className="text-[9px] font-mono text-[#A89C8E] bg-[#1C1815] border border-[#2E2721] px-1.5 py-0.2 rounded shrink-0">
                           {acc.account_code}

@@ -28,7 +28,6 @@ export const GlobalRemotePublisher: React.FC<Props> = ({ partnerId }) => {
   const activeAccountCodeRef = useRef<string | null>(null);
 
   const [publishProgress, setPublishProgress] = useState<PublishProgressData | null>(null);
-  const [showingChrome, setShowingChrome] = useState(false);
 
   // Broadcast de progresso em tempo real para o Painel Administrativo
   const broadcastProgress = (data: PublishProgressData) => {
@@ -475,44 +474,7 @@ export const GlobalRemotePublisher: React.FC<Props> = ({ partnerId }) => {
         </span>
       </div>
 
-      {/* Botão "Ver publicação" — só visível para publicações remotas em andamento */}
-      {publishProgress.isRemote &&
-        publishProgress.status !== 'done' &&
-        publishProgress.status !== 'error' &&
-        activeAccountCodeRef.current && (
-          <button
-            onClick={async () => {
-              if (showingChrome) return;
-              setShowingChrome(true);
-              try {
-                if (window.electronAPI?.showChromeSession) {
-                  const res = await window.electronAPI.showChromeSession(activeAccountCodeRef.current!);
-                  if (res && !res.success) {
-                    console.warn('[REMOTE PUBLISHER] Não foi possível trazer Chrome para frente:', res.error);
-                  }
-                }
-              } catch (e) {
-                console.warn('[REMOTE PUBLISHER] showChromeSession erro:', e);
-              } finally {
-                setTimeout(() => setShowingChrome(false), 1500);
-              }
-            }}
-            disabled={showingChrome}
-            className="w-full flex items-center justify-center gap-2 text-[11px] font-semibold text-[#1C1815] bg-[#C59B27] hover:bg-[#DFC068] disabled:opacity-60 disabled:cursor-not-allowed rounded-lg py-1.5 transition-colors"
-          >
-            {showingChrome ? (
-              <>
-                <span className="animate-spin text-xs">⚙️</span>
-                A abrir janela…
-              </>
-            ) : (
-              <>
-                <span>👁</span>
-                Ver publicação
-              </>
-            )}
-          </button>
-        )}
+
     </div>
   );
 };

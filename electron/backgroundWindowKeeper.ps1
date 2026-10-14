@@ -79,6 +79,15 @@ public class WindowKeeper {
     public static extern bool EnableMenuItem(IntPtr hMenu, uint uIDEnableItem, uint uEnable);
 
     [DllImport("user32.dll")]
+    public static extern int GetMenuItemCount(IntPtr hMenu);
+
+    [DllImport("user32.dll")]
+    public static extern bool RemoveMenu(IntPtr hMenu, uint uPosition, uint uFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool DestroyMenu(IntPtr hMenu);
+
+    [DllImport("user32.dll")]
     public static extern bool IsZoomed(IntPtr hWnd);
 
     [DllImport("user32.dll")]
@@ -93,29 +102,36 @@ public class WindowKeeper {
     [DllImport("user32.dll")]
     public static extern bool SetWindowPlacement(IntPtr hWnd, [In] ref WINDOWPLACEMENT lpwndpl);
 
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
     private const int GWL_STYLE   = -16;
     private const int GWL_EXSTYLE = -20;
 
     private const int WS_MAXIMIZE      = 0x01000000;
     private const int WS_MAXIMIZEBOX   = 0x00010000;
     private const int WS_MINIMIZEBOX   = 0x00020000;
+    private const int WS_SYSMENU       = 0x00080000;
     private const int WS_EX_TOOLWINDOW = 0x00000080;
     private const int WS_EX_APPWINDOW  = 0x00040000;
+    private const int WS_EX_NOACTIVATE = 0x08000000;
 
-    // SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED (SEM SWP_NOMOVE!)
-    private const uint SWP_FLAGS_STYLE = 0x0001 | 0x0004 | 0x0010 | 0x0020;
-    // Flags para mover para coordenadas offscreen garantindo que não há restrições
-    private const uint SWP_FLAGS_MOVE  = 0x0004 | 0x0010 | 0x0020 | 0x0040; // SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW
+    // SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+    private const uint SWP_FLAGS_STYLE = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020;
+    // SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW (com move + resize)
+    private const uint SWP_FLAGS_MOVE  = 0x0004 | 0x0010 | 0x0020 | 0x0040;
 
     private const uint SC_SIZE      = 0xF000;
     private const uint SC_MOVE      = 0xF010;
     private const uint SC_MINIMIZE  = 0xF020;
     private const uint SC_MAXIMIZE  = 0xF030;
+    private const uint SC_CLOSE     = 0xF060;
     private const uint SC_RESTORE   = 0xF120;
 
-    private const uint MF_BYCOMMAND = 0x00000000;
-    private const uint MF_GRAYED    = 0x00000001;
-    private const uint MF_DISABLED  = 0x00000002;
+    private const uint MF_BYCOMMAND  = 0x00000000;
+    private const uint MF_BYPOSITION = 0x00000400;
+    private const uint MF_GRAYED     = 0x00000001;
+    private const uint MF_DISABLED   = 0x00000002;
 
     private static ITaskbarList _taskbarList;
 
@@ -126,106 +142,136 @@ public class WindowKeeper {
         } catch {}
     }
 
+    private static void GuardSingleWindow(IntPtr hWnd) {
+        bool changed = false;
+
+        // ── 1. Remover SEMPRE da barra de tarefas via ITaskbarList COM ──
+        try {
+            if (_taskbarList != null) {
+                _taskbarList.DeleteTab(hWnd);
+            }
+        } catch {}
+
+        // ── 2. Aplicar WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE e remover WS_EX_APPWINDOW ──
+        //       Isto impede a janela de aparecer na barra de tarefas e no Alt+Tab.
+        try {
+            int exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
+            if (exStyle != 0) {
+                int neededEx = (exStyle | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & ~WS_EX_APPWINDOW;
+                if (exStyle != neededEx) {
+                    SetWindowLong(hWnd, GWL_EXSTYLE, neededEx);
+                    SetWindowPos(hWnd, IntPtr.Zero, 0, 0, 0, 0, SWP_FLAGS_STYLE);
+                    changed = true;
+                }
+            }
+        } catch {}
+
+        // ── 3. Tratar janela MINIMIZADA (IsIconic) ou MAXIMIZADA (IsZoomed) ──
+        try {
+            if (IsIconic(hWnd) || IsZoomed(hWnd)) {
+                ShowWindow(hWnd, 0); // SW_HIDE
+                WINDOWPLACEMENT wp = new WINDOWPLACEMENT();
+                wp.length = Marshal.SizeOf(wp);
+                if (GetWindowPlacement(hWnd, ref wp)) {
+                    wp.rcNormalPosition.Left = -32000;
+                    wp.rcNormalPosition.Top = -32000;
+                    wp.rcNormalPosition.Right = -30800;
+                    wp.rcNormalPosition.Bottom = -31190;
+                    wp.showCmd = 0; // SW_HIDE
+                    SetWindowPlacement(hWnd, ref wp);
+                }
+                ShowWindow(hWnd, 4); // SW_SHOWNOACTIVATE
+                SetWindowPos(hWnd, IntPtr.Zero, -32000, -32000, 1200, 810, SWP_FLAGS_MOVE);
+                changed = true;
+            }
+        } catch {}
+
+        // ── 4. Bloquear maximizar/minimizar e remover WS_SYSMENU ──
+        //       Remover WS_SYSMENU e WS_MAXIMIZEBOX impede o Chrome de mostrar qualquer menu
+        //       de contexto no clique direito na barra de tarefas ou permitir maximizar.
+        try {
+            int style = GetWindowLong(hWnd, GWL_STYLE);
+            if (style != 0) {
+                if (IsZoomed(hWnd) || (style & WS_MAXIMIZE) != 0) {
+                    ShowWindow(hWnd, 0); // SW_HIDE
+                    ShowWindow(hWnd, 4); // SW_SHOWNOACTIVATE
+                    SetWindowPos(hWnd, IntPtr.Zero, -32000, -32000, 1200, 810, SWP_FLAGS_MOVE);
+                    style = GetWindowLong(hWnd, GWL_STYLE);
+                    changed = true;
+                }
+
+                int neededStyle = style & ~WS_MAXIMIZEBOX & ~WS_MAXIMIZE & ~WS_MINIMIZEBOX & ~WS_SYSMENU;
+                if (style != neededStyle) {
+                    SetWindowLong(hWnd, GWL_STYLE, neededStyle);
+                    SetWindowPos(hWnd, IntPtr.Zero, 0, 0, 0, 0, SWP_FLAGS_STYLE);
+                    changed = true;
+                }
+            }
+        } catch {}
+
+        // ── 5. Destruir completamente o menu de sistema ──
+        //       Desabilitar e deletar SC_MAXIMIZE, SC_RESTORE, SC_SIZE, SC_MOVE
+        //       e remover todos os itens do menu para impedir qualquer menu de contexto.
+        try {
+            IntPtr hMenu = GetSystemMenu(hWnd, false);
+            if (hMenu != IntPtr.Zero) {
+                EnableMenuItem(hMenu, SC_MAXIMIZE, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
+                EnableMenuItem(hMenu, SC_RESTORE, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
+                EnableMenuItem(hMenu, SC_SIZE, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
+                EnableMenuItem(hMenu, SC_MOVE, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
+                DeleteMenu(hMenu, SC_MAXIMIZE, MF_BYCOMMAND);
+                DeleteMenu(hMenu, SC_RESTORE, MF_BYCOMMAND);
+                int count = GetMenuItemCount(hMenu);
+                for (int i = count - 1; i >= 0; i--) {
+                    RemoveMenu(hMenu, (uint)i, MF_BYPOSITION);
+                }
+            }
+        } catch {}
+
+        // ── 6. Ciclo SW_HIDE + SW_SHOWNOACTIVATE apenas se os estilos foram alterados ──
+        try {
+            if (changed && IsWindowVisible(hWnd)) {
+                ShowWindow(hWnd, 0); // SW_HIDE
+                ShowWindow(hWnd, 4); // SW_SHOWNOACTIVATE
+            }
+        } catch {}
+
+        // ── 7. Forçar coordenadas offscreen (-32000, -32000) se estiver visível na tela ──
+        try {
+            RECT rect;
+            if (GetWindowRect(hWnd, out rect)) {
+                if (rect.Left > -10000 || rect.Top > -10000) {
+                    WINDOWPLACEMENT wp = new WINDOWPLACEMENT();
+                    wp.length = Marshal.SizeOf(wp);
+                    if (GetWindowPlacement(hWnd, ref wp)) {
+                        wp.rcNormalPosition.Left = -32000;
+                        wp.rcNormalPosition.Top = -32000;
+                        wp.rcNormalPosition.Right = -30800;
+                        wp.rcNormalPosition.Bottom = -31190;
+                        SetWindowPlacement(hWnd, ref wp);
+                    }
+                    SetWindowPos(hWnd, IntPtr.Zero, -32000, -32000, 1200, 810, SWP_FLAGS_MOVE);
+                }
+            }
+        } catch {}
+
+        // ── 8. Garantir remoção da taskbar novamente após todas as alterações ──
+        try {
+            if (_taskbarList != null) {
+                _taskbarList.DeleteTab(hWnd);
+            }
+        } catch {}
+    }
+
     public static void GuardWindows(uint[] pids) {
         EnumWindows((hWnd, lParam) => {
             uint windowPid;
             GetWindowThreadProcessId(hWnd, out windowPid);
             foreach (uint p in pids) {
                 if (windowPid == p) {
-                    // 1. Remover SEMPRE da barra de tarefas via ITaskbarList
-                    try {
-                        if (_taskbarList != null) {
-                            _taskbarList.DeleteTab(hWnd);
-                        }
-                    } catch {}
-
-                    // 2. Aplicar WS_EX_TOOLWINDOW SEMPRE (impede aparicao na barra e Alt+Tab)
-                    try {
-                        int exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
-                        if (exStyle != 0) {
-                            int neededEx = (exStyle | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
-                            if (exStyle != neededEx) {
-                                SetWindowLong(hWnd, GWL_EXSTYLE, neededEx);
-                                SetWindowPos(hWnd, IntPtr.Zero, 0, 0, 0, 0, SWP_FLAGS_STYLE);
-                            }
-                        }
-                    } catch {}
-
-                    // 3. Tratar janela MINIMIZADA (IsIconic):
-                    //    Se o usuário minimizou a janela no login visível e o fluxo mudou para segundo plano:
-                    //    O Windows mantém o botão minimizado na barra. Cancelamos o estado minimizado,
-                    //    definimos a posição de restauração para (5000, 5000) e ocultamos da barra.
-                    try {
-                        if (IsIconic(hWnd)) {
-                            ShowWindow(hWnd, 0); // SW_HIDE (destrói o botão na barra de tarefas)
-                            WINDOWPLACEMENT wp = new WINDOWPLACEMENT();
-                            wp.length = Marshal.SizeOf(wp);
-                            if (GetWindowPlacement(hWnd, ref wp)) {
-                                wp.rcNormalPosition.Left = 5000;
-                                wp.rcNormalPosition.Top = 5000;
-                                wp.rcNormalPosition.Right = 6280;
-                                wp.rcNormalPosition.Bottom = 5850;
-                                wp.showCmd = 0; // SW_HIDE
-                                SetWindowPlacement(hWnd, ref wp);
-                            }
-                            ShowWindow(hWnd, 4); // SW_SHOWNOACTIVATE
-                            SetWindowPos(hWnd, IntPtr.Zero, 5000, 5000, 1280, 850, SWP_FLAGS_MOVE);
-                        }
-                    } catch {}
-
-                    // 4. Bloquear permanentemente "Maximizar", "Restaurar" e desfazer qualquer estado maximizado
-                    try {
-                        int style = GetWindowLong(hWnd, GWL_STYLE);
-                        if (style != 0) {
-                            if (IsZoomed(hWnd) || (style & WS_MAXIMIZE) != 0) {
-                                ShowWindow(hWnd, 4); // SW_SHOWNOACTIVATE
-                                style = GetWindowLong(hWnd, GWL_STYLE);
-                            }
-
-                            int neededStyle = style & ~WS_MAXIMIZEBOX & ~WS_MAXIMIZE & ~WS_MINIMIZEBOX;
-                            if (style != neededStyle) {
-                                SetWindowLong(hWnd, GWL_STYLE, neededStyle);
-                                SetWindowPos(hWnd, IntPtr.Zero, 0, 0, 0, 0, SWP_FLAGS_STYLE);
-                            }
-                        }
-                    } catch {}
-
-                    // 5. Bloquear e desabilitar do menu de sistema (clique direito na barra, miniatura e titulo)
-                    try {
-                        IntPtr hMenu = GetSystemMenu(hWnd, false);
-                        if (hMenu != IntPtr.Zero) {
-                            EnableMenuItem(hMenu, SC_MAXIMIZE, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-                            EnableMenuItem(hMenu, SC_RESTORE,  MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-                            EnableMenuItem(hMenu, SC_MOVE,     MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-                            EnableMenuItem(hMenu, SC_SIZE,     MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-                            EnableMenuItem(hMenu, SC_MINIMIZE, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
-
-                            DeleteMenu(hMenu, SC_MAXIMIZE, MF_BYCOMMAND);
-                            DeleteMenu(hMenu, SC_RESTORE,  MF_BYCOMMAND);
-                            DeleteMenu(hMenu, SC_MOVE,     MF_BYCOMMAND);
-                            DeleteMenu(hMenu, SC_SIZE,     MF_BYCOMMAND);
-                            DeleteMenu(hMenu, SC_MINIMIZE, MF_BYCOMMAND);
-                        }
-                    } catch {}
-
-                    // 6. Forçar coordenadas offscreen (5000, 5000) se estiver visível na tela
-                    RECT rect;
-                    if (GetWindowRect(hWnd, out rect)) {
-                        if (!IsIconic(hWnd) && (rect.Left < 3000 || rect.Top < 3000)) {
-                            // Garantir que rcNormalPosition também está em 5000, 5000 para que nunca restaure na tela visível
-                            WINDOWPLACEMENT wp = new WINDOWPLACEMENT();
-                            wp.length = Marshal.SizeOf(wp);
-                            if (GetWindowPlacement(hWnd, ref wp)) {
-                                wp.rcNormalPosition.Left = 5000;
-                                wp.rcNormalPosition.Top = 5000;
-                                wp.rcNormalPosition.Right = 6280;
-                                wp.rcNormalPosition.Bottom = 5850;
-                                SetWindowPlacement(hWnd, ref wp);
-                            }
-                            SetWindowPos(hWnd, IntPtr.Zero, 5000, 5000, 1280, 850, SWP_FLAGS_MOVE);
-                        }
-                    }
-                    break;
+                    GuardSingleWindow(hWnd);
+                    // NÃO usar break: processar TODAS as janelas do mesmo PID
+                    // (Chrome pode ter múltiplas janelas, popups, diálogos)
                 }
             }
             return true;
@@ -233,6 +279,29 @@ public class WindowKeeper {
     }
 }
 '@
+
+function Get-AllDescendantPids {
+    param([int]$RootPid)
+    $result = @([uint32]$RootPid)
+    $queue = [System.Collections.Queue]::new()
+    $queue.Enqueue($RootPid)
+    try {
+        # Obter TODOS os processos de uma vez para evitar múltiplas queries WMI
+        $allProcs = Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId -ErrorAction SilentlyContinue
+        if ($allProcs) {
+            while ($queue.Count -gt 0) {
+                $parentId = $queue.Dequeue()
+                foreach ($p in $allProcs) {
+                    if ($p.ParentProcessId -eq $parentId -and $p.ProcessId -ne $parentId) {
+                        $result += [uint32]$p.ProcessId
+                        $queue.Enqueue($p.ProcessId)
+                    }
+                }
+            }
+        }
+    } catch {}
+    return $result
+}
 
 try {
     Add-Type -TypeDefinition $cs -ErrorAction SilentlyContinue
@@ -251,17 +320,10 @@ try {
             continue
         }
 
-        # Actualizar lista de PIDs filhos a cada 15 iteracoes (~1.2s)
-        if ($iter % 15 -eq 0) {
-            $pids = @([uint32]$TargetPid)
-            try {
-                $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $TargetPid" -ErrorAction SilentlyContinue |
-                            Select-Object -ExpandProperty ProcessId
-                if ($children) {
-                    foreach ($c in $children) { $pids += [uint32]$c }
-                }
-            } catch {}
-            $cachedPids = $pids
+        # Actualizar lista de PIDs descendentes a cada 5 iteracoes (~0.4s)
+        # Busca recursiva: filhos, netos, bisnetos, etc.
+        if ($iter % 5 -eq 0) {
+            $cachedPids = Get-AllDescendantPids -RootPid $TargetPid
         }
         $iter++
 

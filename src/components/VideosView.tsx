@@ -14,6 +14,23 @@ const PLATFORM_ORDER: Record<string, number> = {
   instagram: 4,
 };
 
+const isEmailLike = (str?: string | null): boolean => {
+  if (!str) return false;
+  return str.includes('@') && (str.includes('.com') || str.includes('.net') || str.includes('.org') || str.includes('.io') || str.includes('.br') || str.includes('.pt') || /\S+@\S+\.\S+/.test(str));
+};
+
+const formatAccountDisplayName = (username?: string, platform?: string) => {
+  if (!username || isEmailLike(username)) {
+    switch (platform) {
+      case 'youtube': return 'Canal YouTube';
+      case 'facebook': return 'Página Facebook';
+      case 'instagram': return 'Conta Creator';
+      default: return 'Canal TikTok';
+    }
+  }
+  return username.startsWith('@') ? username : `@${username}`;
+};
+
 export interface VideoPackage {
   packageId: string;
   videoId: string;
@@ -48,24 +65,7 @@ export const VideosView: React.FC<Props> = ({ partnerId }) => {
   const [previewVideoUrl, setPreviewVideoUrl] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'pending' | 'published'>('pending');
   const [searchTerm, setSearchTerm] = useState('');
-  const [publishInBackground, setPublishInBackground] = useState<boolean>(() => {
-    try {
-      const saved = localStorage.getItem('agent_publish_background_mode');
-      return saved !== null ? saved === 'true' : true;
-    } catch {
-      return true;
-    }
-  });
-
-  const togglePublishInBackground = () => {
-    setPublishInBackground((prev) => {
-      const nextVal = !prev;
-      try {
-        localStorage.setItem('agent_publish_background_mode', String(nextVal));
-      } catch {}
-      return nextVal;
-    });
-  };
+  const publishInBackground = true;
 
   // Canal Realtime para transmitir progresso em tempo real ao Painel Administrativo
   const broadcastChannel = useMemo(() => {
@@ -627,19 +627,6 @@ export const VideosView: React.FC<Props> = ({ partnerId }) => {
             </button>
           </div>
 
-          {/* Seletor de Modo: Em Segundo Plano vs. Janela Visível */}
-          <button
-            onClick={togglePublishInBackground}
-            title={publishInBackground ? "A publicação automática roda em segundo plano sem incomodar na tela. Clique para alternar para Janela Visível." : "A janela do Chrome abrirá visível na tela durante a publicação. Clique para alternar para Segundo Plano."}
-            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 border cursor-pointer ${
-              publishInBackground
-                ? 'bg-[#1C1815] border-[#10b981]/50 text-[#10b981] hover:bg-[#10b981]/15 shadow-sm'
-                : 'bg-[#1C1815] border-[#f59e0b]/50 text-[#f59e0b] hover:bg-[#f59e0b]/15 shadow-sm'
-            }`}
-          >
-            <span className="text-[14px]">{publishInBackground ? '🤫' : '👁️'}</span>
-            <span>{publishInBackground ? 'Segundo Plano' : 'Janela Visível'}</span>
-          </button>
 
           <button
             onClick={fetchJobs}
@@ -831,7 +818,7 @@ export const VideosView: React.FC<Props> = ({ partnerId }) => {
                                 </span>
                                 <PlatformIcon platform={plat} className="w-5 h-5 rounded" />
                                 <span className="font-bold text-xs text-[#F5EFE6] truncate max-w-[120px]">
-                                  {job.accounts?.username || 'Conta'}
+                                  {formatAccountDisplayName(job.accounts?.username, plat)}
                                 </span>
                               </div>
 
@@ -988,7 +975,7 @@ export const VideosView: React.FC<Props> = ({ partnerId }) => {
                             <div className="flex items-center gap-2">
                               <PlatformIcon platform={job.accounts?.platform} className="w-4 h-4 rounded" />
                               <span className="font-medium text-[#EDE4D5]">
-                                {job.accounts?.username}
+                                {formatAccountDisplayName(job.accounts?.username, job.accounts?.platform)}
                               </span>
                             </div>
 

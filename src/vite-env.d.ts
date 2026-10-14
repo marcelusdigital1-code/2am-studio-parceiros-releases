@@ -40,7 +40,7 @@ interface ElectronAPI {
   onChromePageLoaded: (cb: (data: { profileId: string }) => void) => void;
   onChromeInjected: (cb: (data: { profileId: string; emailFilled: boolean; passFilled: boolean }) => void) => void;
   onChromeClosed: (cb: (data: { profileId: string }) => void) => void;
-  onChromeRequest2FA: (cb: (data: { profileId: string }) => void) => void;
+  onChromeRequest2FA: (cb: (data: { profileId: string; partnerId?: string; platform?: string; isRetry?: boolean; errorMessage?: string; accountId?: string; codeType?: string; email?: string }) => void) => void;
   onTikTokQRStream?: (cb: (data: { profileId: string; qrDataUrl: string }) => void) => void;
   onChromeAuthStatus: (cb: (data: { profileId: string; isLoggedIn: boolean }) => void) => void;
   onChromeBlockedAttempt: (cb: (data: { profileId: string; url: string; redirectedTo: string; timestamp: string }) => void) => void;
