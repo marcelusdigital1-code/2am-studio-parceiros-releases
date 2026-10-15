@@ -3182,22 +3182,26 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           }
                         }
 
-                        // 2. Procurar botões de consentimento/continuação
-                        const btns = Array.from(document.querySelectorAll('button, div[role="button"], a[role="button"]'));
-                        for (const btn of btns) {
-                          const t = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-                          if (t.includes('não') && !t.includes('agora não') && !t.includes('not now')) continue;
-                          if (t.includes('cancel') || t.includes('recusar') || t.includes('negar')) continue;
+                        // 2. Procurar botões de consentimento/continuação/pular verificação opcional
+                        const btns = Array.from(document.querySelectorAll('button, div[role="button"], a[role="button"], [role="link"], span'));
+                        for (const rawBtn of btns) {
+                          const btn = (rawBtn as any).closest('button, div[role="button"], a[role="button"], [role="link"]') || rawBtn;
+                          const t = ((btn as any).innerText || (btn as any).textContent || '').trim().toLowerCase();
+                          if (t.includes('não') && !t.includes('agora não') && !t.includes('não agora') && !t.includes('not now')) continue;
+                          if (t.includes('nao') && !t.includes('agora nao') && !t.includes('nao agora') && !t.includes('not now')) continue;
+                          if (t.includes('recusar') || t.includes('negar')) continue;
                           if (
                             t === 'continuar' || t === 'permitir' || t === 'aceder' || t === 'continue' || t === 'allow' ||
                             t === 'confirmar' || t === 'aceitar' || t === 'concordo' || t === 'seguinte' || t === 'next' ||
-                            t === 'avançar' || t === 'agora não' || t === 'não agora' || t === 'not now' ||
+                            t === 'avançar' || t === 'agora não' || t === 'agora nao' || t === 'não agora' || t === 'nao agora' ||
+                            t === 'not now' || t === 'skip' || t === 'ignorar' || t === 'talvez mais tarde' || t === 'ahora no' ||
                             t.includes('continuar') || t.includes('permitir') || t.includes('aceder') ||
-                            t.includes('continue') || t.includes('allow') || t.includes('concordo')
+                            t.includes('continue') || t.includes('allow') || t.includes('concordo') ||
+                            t.includes('agora não') || t.includes('agora nao') || t.includes('not now')
                           ) {
                             try { (btn as any).click(); } catch(_) {}
-                            const r = btn.getBoundingClientRect();
-                            if (r.width > 20 && r.height > 15) {
+                            const r = (btn as any).getBoundingClientRect();
+                            if (r.width > 10 && r.height > 10) {
                               return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
                             }
                           }
@@ -3321,11 +3325,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                         }).catch(() => null);
                         const curGoogleUrl = (urlCheckRes?.result?.value || '').toLowerCase();
 
-                        if (
-                          curGoogleUrl.includes('/challenge/recaptcha') ||
-                          curGoogleUrl.includes('/challenge/ipp') ||
-                          curGoogleUrl.includes('/challenge/iap')
-                        ) {
+                        if (curGoogleUrl.includes('/challenge/recaptcha')) {
                           console.log(`[GOOGLE-LOGIN] CAPTCHA na URL: ${curGoogleUrl} — aguardando...`);
                           await new Promise(r => setTimeout(r, 3000));
                           continue;
@@ -4478,6 +4478,47 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                                 }
                               }
 
+                              // ── Selfie / Vídeo do rosto: Google pede selfie para verificação → clicar "Agora não" para pular ──
+                              var bodyClean = (document.body ? (document.body.innerText || document.body.textContent || '') : '').toLowerCase();
+                              var isSelfieScreen = bodyClean.includes('selfie') || bodyClean.includes('breve vídeo') || bodyClean.includes('breve video') ||
+                                bodyClean.includes('grave um') || bodyClean.includes('adicione uma selfie') || bodyClean.includes('add a selfie') ||
+                                bodyClean.includes('record a short video') || bodyClean.includes('gravar um vídeo') || bodyClean.includes('gravar um video') ||
+                                bodyClean.includes('vídeo da sua cara') || bodyClean.includes('video da sua cara') ||
+                                url.includes('/speedbump/') || url.includes('/signinanswer') || url.includes('/challenge/ipp') || url.includes('/challenge/iap');
+                              if (isSelfieScreen) {
+                                var allCandidates = Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"], span, div'));
+                                var skipSelfieBtn = null;
+                                for (var sbi = 0; sbi < allCandidates.length; sbi++) {
+                                  var rawBtn = allCandidates[sbi];
+                                  var btnEl = rawBtn.closest('button, a, [role="button"], [role="link"]') || rawBtn;
+                                  var bt = (btnEl.innerText || btnEl.textContent || '').trim().toLowerCase();
+                                  if (!bt || bt.length > 50) continue;
+                                  if (
+                                    bt === 'agora não' || bt === 'agora nao' || bt === 'not now' || bt === 'skip' ||
+                                    bt === 'ignorar' || bt === 'talvez mais tarde' || bt === 'maybe later' ||
+                                    bt === 'não agora' || bt === 'nao agora' || bt === 'ahora no' ||
+                                    bt === 'não, obrigado' || bt === 'nao, obrigado' || bt === 'no thanks' ||
+                                    bt === 'cancelar' || bt === 'cancel' ||
+                                    bt.includes('agora não') || bt.includes('agora nao') || bt.includes('not now') || bt.includes('ahora no')
+                                  ) {
+                                    var sbr = btnEl.getBoundingClientRect();
+                                    if (sbr.width > 5 && sbr.height > 5 && sbr.width < 500 && sbr.height < 150) {
+                                      skipSelfieBtn = btnEl;
+                                      break;
+                                    }
+                                  }
+                                }
+                                if (skipSelfieBtn) {
+                                  try { skipSelfieBtn.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch(_) {}
+                                  try { skipSelfieBtn.focus(); } catch(_) {}
+                                  try { skipSelfieBtn.click(); } catch(_) {}
+                                  var ssr = skipSelfieBtn.getBoundingClientRect();
+                                  if (ssr.width > 5 && ssr.height > 5) {
+                                    return { action: 'selfie_skip', coords: { x: ssr.left + ssr.width/2, y: ssr.top + ssr.height/2 } };
+                                  }
+                                }
+                              }
+
                               // Consentimento / Not Now / Continuar / Confirmar / Permitir
                               // NUNCA disparar consent em páginas de challenge — isAnyChallengePage trata-as
                               if (!url.includes('/challenge')) {
@@ -4837,11 +4878,13 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                           continue;
                         }
 
-                        // E. Consentimento / Not Now / Continuar
-                        if (pa?.action === 'consent_click' && pa.coords) {
-                          console.log('[TIKTOK-GOOGLE-LOGIN] Clicando em Continuar/Agora não...');
+                        // E. Consentimento / Not Now / Continuar / Pular Selfie
+                        if ((pa?.action === 'consent_click' || pa?.action === 'selfie_skip') && pa.coords) {
+                          const isSelfie = pa.action === 'selfie_skip';
+                          console.log(`[TIKTOK-GOOGLE-LOGIN] Clicando em ${isSelfie ? 'Agora não (Pular verificação de selfie)' : 'Continuar/Agora não'}...`);
+                          setBadge(isSelfie ? '📸 Pulando verificação de selfie...' : 'Confirmando consentimento...', '#38bdf8');
                           await realClickAt(pa.coords.x, pa.coords.y, undefined, wsTarget);
-                          await new Promise(r => setTimeout(r, 3000));
+                          await new Promise(r => setTimeout(r, 2500));
                           continue;
                         }
 
@@ -6947,6 +6990,47 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                                 }
                               }
 
+                              // ── Selfie / Vídeo do rosto: Google pede selfie para verificação → clicar "Agora não" para pular ──
+                              var bodyClean = (document.body ? (document.body.innerText || document.body.textContent || '') : '').toLowerCase();
+                              var isSelfieScreen = bodyClean.includes('selfie') || bodyClean.includes('breve vídeo') || bodyClean.includes('breve video') ||
+                                bodyClean.includes('grave um') || bodyClean.includes('adicione uma selfie') || bodyClean.includes('add a selfie') ||
+                                bodyClean.includes('record a short video') || bodyClean.includes('gravar um vídeo') || bodyClean.includes('gravar um video') ||
+                                bodyClean.includes('vídeo da sua cara') || bodyClean.includes('video da sua cara') ||
+                                url.includes('/speedbump/') || url.includes('/signinanswer') || url.includes('/challenge/ipp') || url.includes('/challenge/iap');
+                              if (isSelfieScreen) {
+                                var allCandidates = Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"], span, div'));
+                                var skipSelfieBtn = null;
+                                for (var sbi = 0; sbi < allCandidates.length; sbi++) {
+                                  var rawBtn = allCandidates[sbi];
+                                  var btnEl = rawBtn.closest('button, a, [role="button"], [role="link"]') || rawBtn;
+                                  var bt = (btnEl.innerText || btnEl.textContent || '').trim().toLowerCase();
+                                  if (!bt || bt.length > 50) continue;
+                                  if (
+                                    bt === 'agora não' || bt === 'agora nao' || bt === 'not now' || bt === 'skip' ||
+                                    bt === 'ignorar' || bt === 'talvez mais tarde' || bt === 'maybe later' ||
+                                    bt === 'não agora' || bt === 'nao agora' || bt === 'ahora no' ||
+                                    bt === 'não, obrigado' || bt === 'nao, obrigado' || bt === 'no thanks' ||
+                                    bt === 'cancelar' || bt === 'cancel' ||
+                                    bt.includes('agora não') || bt.includes('agora nao') || bt.includes('not now') || bt.includes('ahora no')
+                                  ) {
+                                    var sbr = btnEl.getBoundingClientRect();
+                                    if (sbr.width > 5 && sbr.height > 5 && sbr.width < 500 && sbr.height < 150) {
+                                      skipSelfieBtn = btnEl;
+                                      break;
+                                    }
+                                  }
+                                }
+                                if (skipSelfieBtn) {
+                                  try { skipSelfieBtn.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch(_) {}
+                                  try { skipSelfieBtn.focus(); } catch(_) {}
+                                  try { skipSelfieBtn.click(); } catch(_) {}
+                                  var ssr = skipSelfieBtn.getBoundingClientRect();
+                                  if (ssr.width > 5 && ssr.height > 5) {
+                                    return { action: 'selfie_skip', coords: { x: ssr.left + ssr.width/2, y: ssr.top + ssr.height/2 } };
+                                  }
+                                }
+                              }
+
                               // Consentimento / Not Now / Continuar / Confirmar no YouTube
                               // NUNCA disparar consent em páginas de challenge — isAnyChallengePage trata-as
                               if (!url.includes('/challenge')) {
@@ -7301,11 +7385,13 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                         }
 
 
-                        // E. Consentimento / Not Now / Continuar
-                        if (pa?.action === 'consent_click' && pa.coords) {
-                          console.log('[YOUTUBE-LOGIN] Clicando em Continuar/Agora não...');
+                        // E. Consentimento / Not Now / Continuar / Pular Selfie
+                        if ((pa?.action === 'consent_click' || pa?.action === 'selfie_skip') && pa.coords) {
+                          const isSelfie = pa.action === 'selfie_skip';
+                          console.log(`[YOUTUBE-LOGIN] Clicando em ${isSelfie ? 'Agora não (Pular verificação de selfie)' : 'Continuar/Agora não'}...`);
+                          setBadge(isSelfie ? '📸 Pulando verificação de selfie...' : 'Confirmando consentimento...', '#38bdf8');
                           await realClickAt(pa.coords.x, pa.coords.y);
-                          await new Promise(r => setTimeout(r, 3000));
+                          await new Promise(r => setTimeout(r, 2500));
                           continue;
                         }
 
