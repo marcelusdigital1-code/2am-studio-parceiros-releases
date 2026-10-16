@@ -3977,7 +3977,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                               try {
                                 var codeVal = ${JSON.stringify(incomingCode)};
                                 function fireEvents(el) {
-                                  ['input','change','blur','keyup','keydown'].forEach(function(evt) {
+                                  ['focus','input','change','blur','keyup','keydown','keypress'].forEach(function(evt) {
                                     try { el.dispatchEvent(new Event(evt, { bubbles: true, cancelable: true })); } catch(e) {}
                                   });
                                 }
@@ -4005,7 +4005,12 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                                     digitInputs[i].focus();
                                     setSingleVal(digitInputs[i], codeVal[i]);
                                   }
-                                  return { success: true, count: digitInputs.length, type: 'digits' };
+                                  // Verificar se os valores foram aplicados
+                                  var allFilled = true;
+                                  for (var j = 0; j < codeVal.length; j++) {
+                                    if (digitInputs[j].value !== codeVal[j]) { allFilled = false; break; }
+                                  }
+                                  return { success: true, count: digitInputs.length, type: 'digits', allFilled: allFilled };
                                 }
 
                                 // 2. Procurar input único
@@ -4026,7 +4031,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                                     if (r.width > 20 && r.height > 15) {
                                       inp.focus();
                                       setSingleVal(inp, codeVal);
-                                      return { success: true, type: 'single' };
+                                      return { success: inp.value === codeVal, type: 'single', actualLen: inp.value.length };
                                     }
                                   }
                                 }
@@ -4034,32 +4039,80 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                               } catch(e) { return { success: false, err: e.message }; }
                             })()`;
 
-                            await cdpSend(ws, 'Runtime.evaluate', { expression: exprInjectCode, returnByValue: true }, targetSessionId).catch(() => null);
+                            const injectRes: any = await cdpSend(ws, 'Runtime.evaluate', { expression: exprInjectCode, returnByValue: true }, targetSessionId).catch(() => null);
+                            const injectData = injectRes?.result?.value;
+                            console.log(`[TIKTOK-VERIFY] Resultado da injeção de código:`, JSON.stringify(injectData));
+
+                            // Se a injeção não preencheu completamente, usar Input.insertText via CDP como fallback
+                            if (!injectData?.success || injectData?.allFilled === false) {
+                              console.warn('[TIKTOK-VERIFY] Injeção via setter não preencheu totalmente. Usando Input.insertText CDP como fallback...');
+                              // Focar o primeiro input de código e usar insertText
+                              await cdpSend(ws, 'Runtime.evaluate', {
+                                expression: `(function() {
+                                  var digitInputs = Array.from(document.querySelectorAll('input')).filter(function(inp) {
+                                    var r = inp.getBoundingClientRect();
+                                    return r.width > 12 && r.height > 12 && (inp.getAttribute('maxlength') === '1' || inp.getAttribute('data-e2e')?.indexOf('digit') > -1 || inp.className.indexOf('digit') > -1);
+                                  });
+                                  if (digitInputs.length > 0) {
+                                    // Limpar todos os inputs de dígitos
+                                    digitInputs.forEach(function(inp) { inp.value = ''; });
+                                    digitInputs[0].focus();
+                                    return { type: 'digits', count: digitInputs.length };
+                                  }
+                                  var single = document.querySelector('input[data-e2e="verify-input"], input[name*="code" i], input[placeholder*="code" i], input[autocomplete="one-time-code"], input[maxlength="6"], input[type="tel"]');
+                                  if (single) {
+                                    single.value = '';
+                                    single.focus();
+                                    single.select();
+                                    return { type: 'single' };
+                                  }
+                                  return null;
+                                })()`
+                              }, targetSessionId).catch(() => {});
+                              await new Promise(r => setTimeout(r, 300));
+                              // Digitar código via CDP Input.insertText char a char
+                              for (const digit of incomingCode) {
+                                await cdpSend(ws, 'Input.insertText', { text: digit }, targetSessionId).catch(() => {});
+                                await new Promise(r => setTimeout(r, 120 + Math.random() * 80));
+                              }
+                            }
                             await new Promise(r => setTimeout(r, 600));
 
-                            // Submeter código
+                            // Submeter código — usar coordenadas reais com scrollIntoView + realClickAt + element.click()
                             const exprSubmitCodeBtn = `(function() {
                               try {
-                                var targetTexts = ['avan\u00e7ar', 'avancar', 'log in', 'iniciar sess\u00e3o', 'entrar', 'seguinte', 'next', 'confirmar', 'submit', 'sign in', 'verificar', 'verify'];
-                                var btns = Array.from(document.querySelectorAll('button, button[type="submit"], div[role="button"]'));
-                                for (var b of btns) {
+                                var targetTexts = ['avan\\u00e7ar', 'avancar', 'log in', 'iniciar sess\\u00e3o', 'entrar', 'seguinte', 'next', 'confirmar', 'submit', 'sign in', 'verificar', 'verify'];
+                                var btns = Array.from(document.querySelectorAll('button, button[type="submit"], div[role="button"], input[type="submit"]'));
+                                for (var bi = 0; bi < btns.length; bi++) {
+                                  var b = btns[bi];
                                   var t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                                  if (targetTexts.some(function(term) { return t === term || t.startsWith(term); })) {
-                                    var r = b.getBoundingClientRect();
-                                    if (r.width > 20 && r.height > 15 && !b.hasAttribute('disabled')) {
-                                      b.click();
-                                      return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: t };
+                                  for (var ti = 0; ti < targetTexts.length; ti++) {
+                                    if (t === targetTexts[ti] || t.indexOf(targetTexts[ti]) === 0) {
+                                      var r = b.getBoundingClientRect();
+                                      if (r.width > 20 && r.height > 15 && !b.disabled) {
+                                        b.scrollIntoView({ block: 'center', behavior: 'instant' });
+                                        var r2 = b.getBoundingClientRect();
+                                        try { b.click(); } catch(e) {}
+                                        try { b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch(e) {}
+                                        return { x: r2.left + r2.width / 2, y: r2.top + r2.height / 2, text: t };
+                                      }
                                     }
                                   }
+                                }
+                                // Fallback: form.submit()
+                                var anyInput = document.querySelector('input[data-e2e="verify-input"], input[maxlength="1"], input[maxlength="6"], input[type="tel"]');
+                                if (anyInput) {
+                                  var form = anyInput.closest('form');
+                                  if (form) { try { form.submit(); } catch(e) {} return { x: 0, y: 0, text: 'form-submit' }; }
                                 }
                                 return null;
                               } catch(e) { return null; }
                             })()`;
                             const submitCodeRes: any = await cdpSend(ws, 'Runtime.evaluate', { expression: exprSubmitCodeBtn, returnByValue: true }, targetSessionId).catch(() => null);
-                            if (submitCodeRes?.result?.value) {
-                              console.log('[TIKTOK-VERIFY] Botão de envio de código clicado via coordenadas...');
+                            if (submitCodeRes?.result?.value && submitCodeRes.result.value.x > 0) {
+                              console.log(`[TIKTOK-VERIFY] Botão de envio de código clicado ("${submitCodeRes.result.value.text}"). Reforçando com realClickAt...`);
                               await realClickAt(submitCodeRes.result.value.x, submitCodeRes.result.value.y, targetSessionId);
-                            } else {
+                            } else if (!submitCodeRes?.result?.value) {
                               console.log('[TIKTOK-VERIFY] Botão de confirmação de código não encontrado, pressionando Enter...');
                               await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 13, key: 'Enter', code: 'Enter' }, targetSessionId).catch(() => {});
                               await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, key: 'Enter', code: 'Enter' }, targetSessionId).catch(() => {});
@@ -4159,64 +4212,197 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                           setBadge('Digitando palavra-passe da conta TikTok...', '#38bdf8');
                           console.log(`[TIKTOK-VERIFY] Focando campo de senha do TikTok e inserindo credencial (${tiktokPass.length} caracteres)...`);
-                          await realClickAt(data.x, data.y, targetSessionId);
-                          await new Promise(r => setTimeout(r, 500));
 
-                          // Limpar campo se houver texto
+                          // 1. Focar o campo de senha via CDP + click real
+                          await cdpSend(ws, 'Runtime.evaluate', {
+                            expression: `(function() {
+                              var el = document.querySelector('input[type="password"]');
+                              if (el) { el.focus(); el.select(); }
+                            })()`
+                          }, targetSessionId).catch(() => {});
+                          await realClickAt(data.x, data.y, targetSessionId);
+                          await new Promise(r => setTimeout(r, 600));
+
+                          // 2. Limpar campo (Ctrl+A + Backspace)
                           await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 65, key: 'a', code: 'KeyA', modifiers: 2 }, targetSessionId).catch(() => {});
                           await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 65, key: 'a', code: 'KeyA' }, targetSessionId).catch(() => {});
                           await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 8, key: 'Backspace', code: 'Backspace' }, targetSessionId).catch(() => {});
                           await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 8, key: 'Backspace', code: 'Backspace' }, targetSessionId).catch(() => {});
+                          await new Promise(r => setTimeout(r, 200));
 
-                          // Digitar a senha com delay humano
+                          // 3. Digitar a senha com Input.insertText (método confiável para campos React/TikTok)
                           for (const char of tiktokPass) {
-                            await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', text: char, unmodifiedText: char }, targetSessionId).catch(() => {});
-                            await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp' }, targetSessionId).catch(() => {});
+                            await cdpSend(ws, 'Input.insertText', { text: char }, targetSessionId).catch(() => {});
                             await new Promise(r => setTimeout(r, 45 + Math.random() * 45));
                           }
-                          await new Promise(r => setTimeout(r, 1000));
+                          await new Promise(r => setTimeout(r, 800));
 
-                          // Submeter: primeiro tenta clicar o botao Avancar / Log in (mais confiavel que Enter no TikTok)
+                          // 4. Verificar se a senha foi realmente digitada no campo
+                          const checkPwdFilled: any = await cdpSend(ws, 'Runtime.evaluate', {
+                            expression: `(function() {
+                              var el = document.querySelector('input[type="password"]');
+                              return el ? el.value.length : 0;
+                            })()`,
+                            returnByValue: true
+                          }, targetSessionId).catch(() => null);
+                          const pwdLen = checkPwdFilled?.result?.value || 0;
+                          console.log(`[TIKTOK-VERIFY] Verificação pós-digitação: campo tem ${pwdLen} caracteres (esperado: ${tiktokPass.length})`);
+
+                          // 5. Se o campo não preencheu, usar fallback com setter nativo do React
+                          if (pwdLen < tiktokPass.length) {
+                            console.warn('[TIKTOK-VERIFY] Campo de senha vazio após Input.insertText! Aplicando fallback com setter nativo...');
+                            await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var el = document.querySelector('input[type="password"]');
+                                if (!el) return false;
+                                el.focus();
+                                var lastVal = el.value;
+                                var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                                if (setter) { setter.call(el, ${JSON.stringify(tiktokPass)}); } else { el.value = ${JSON.stringify(tiktokPass)}; }
+                                var tracker = el._valueTracker; if (tracker) tracker.setValue(lastVal);
+                                el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                                el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'a' }));
+                                return true;
+                              })()`
+                            }, targetSessionId).catch(() => {});
+                            await new Promise(r => setTimeout(r, 500));
+
+                            // Se o setter também falhou, tentar execCommand
+                            const check2: any = await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() { var el = document.querySelector('input[type="password"]'); return el ? el.value.length : 0; })()`,
+                              returnByValue: true
+                            }, targetSessionId).catch(() => null);
+                            if ((check2?.result?.value || 0) < tiktokPass.length) {
+                              console.warn('[TIKTOK-VERIFY] Setter nativo também falhou! Tentando execCommand + insertText CDP em bloco...');
+                              await cdpSend(ws, 'Runtime.evaluate', {
+                                expression: `(function() {
+                                  var el = document.querySelector('input[type="password"]');
+                                  if (el) { el.focus(); el.value = ''; document.execCommand('insertText', false, ${JSON.stringify(tiktokPass)}); }
+                                })()`
+                              }, targetSessionId).catch(() => {});
+                              await new Promise(r => setTimeout(r, 300));
+                              // Último recurso: Input.insertText em bloco
+                              await cdpSend(ws, 'Runtime.evaluate', {
+                                expression: `(function() { var el = document.querySelector('input[type="password"]'); if (el) { el.focus(); el.select(); } })()`
+                              }, targetSessionId).catch(() => {});
+                              await cdpSend(ws, 'Input.insertText', { text: tiktokPass }, targetSessionId).catch(() => {});
+                              await new Promise(r => setTimeout(r, 500));
+                            }
+                          }
+                          await new Promise(r => setTimeout(r, 500));
+
+                          // 6. Submeter: primeiro tenta clicar o botão Avançar / Log in via coordenadas reais (CDP mouse events)
                           setBadge('Submetendo palavra-passe do TikTok...', '#22c55e');
                           console.log('[TIKTOK-VERIFY] Procurando botao Avancar/Log in para clicar...');
-                          const exprSubmitBtn = `(function() {
-                            try {
-                              const targetTexts = ['avan\u00e7ar', 'avancar', 'log in', 'iniciar sess\u00e3o', 'entrar', 'seguinte', 'next', 'confirmar', 'submit', 'sign in', 'logar'];
-                              const btns = Array.from(document.querySelectorAll('button, button[type="submit"], div[role="button"]'));
-                              for (const b of btns) {
-                                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                                if (targetTexts.some(term => t === term || t.startsWith(term))) {
-                                  const r = b.getBoundingClientRect();
-                                  if (r.width > 20 && r.height > 15) {
-                                    return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: t };
-                                  }
-                                }
-                              }
-                              const pwdInput = document.querySelector('input[type="password"]');
-                              if (pwdInput) {
-                                const container = pwdInput.closest('form, div[class*="modal"], div[class*="Modal"], div[class*="container"], div[class*="Container"]') || document.body;
-                                const fallbackBtns = Array.from(container.querySelectorAll('button, button[type="submit"], div[role="button"]'));
-                                for (const b of fallbackBtns) {
-                                  const r = b.getBoundingClientRect();
-                                  if (r.width > 50 && r.height > 30) {
-                                    const style = window.getComputedStyle(b);
-                                    const bg = style.backgroundColor || '';
-                                    if (bg.includes('254') || bg.includes('255, 0') || b.className.toLowerCase().includes('primary') || b.className.toLowerCase().includes('submit')) {
-                                      return { x: r.left + r.width / 2, y: r.top + r.height / 2, text: 'primary-btn' };
+
+                          // Tentar submissão até 3 vezes (botão pode demorar a ativar)
+                          let submitSuccess = false;
+                          for (let submitAttempt = 0; submitAttempt < 3 && !submitSuccess; submitAttempt++) {
+                            const exprSubmitBtn = `(function() {
+                              try {
+                                var targetTexts = ['avan\\u00e7ar', 'avancar', 'log in', 'iniciar sess\\u00e3o', 'entrar', 'seguinte', 'next', 'confirmar', 'submit', 'sign in', 'logar'];
+                                var btns = Array.from(document.querySelectorAll('button, button[type="submit"], div[role="button"], input[type="submit"]'));
+                                for (var bi = 0; bi < btns.length; bi++) {
+                                  var b = btns[bi];
+                                  var t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                                  for (var ti = 0; ti < targetTexts.length; ti++) {
+                                    if (t === targetTexts[ti] || t.indexOf(targetTexts[ti]) === 0) {
+                                      var r = b.getBoundingClientRect();
+                                      if (r.width > 20 && r.height > 15 && !b.disabled) {
+                                        b.scrollIntoView({ block: 'center', behavior: 'instant' });
+                                        var r2 = b.getBoundingClientRect();
+                                        return { x: r2.left + r2.width / 2, y: r2.top + r2.height / 2, text: t };
+                                      }
                                     }
                                   }
                                 }
+                                var pwdInput = document.querySelector('input[type="password"]');
+                                if (pwdInput) {
+                                  var container = pwdInput.closest('form, div[class*="modal"], div[class*="Modal"], div[class*="container"], div[class*="Container"]') || document.body;
+                                  var allBtns = Array.from(container.querySelectorAll('button, button[type="submit"], div[role="button"], input[type="submit"]'));
+                                  for (var fi = 0; fi < allBtns.length; fi++) {
+                                    var fb = allBtns[fi];
+                                    var fr = fb.getBoundingClientRect();
+                                    if (fr.width > 50 && fr.height > 25 && !fb.disabled) {
+                                      var fStyle = window.getComputedStyle(fb);
+                                      var fbg = fStyle.backgroundColor || '';
+                                      var fcn = fb.className ? fb.className.toLowerCase() : '';
+                                      if (fbg.includes('254') || fbg.includes('255, 0') || fbg.includes('fe2c') || fcn.includes('primary') || fcn.includes('submit') || fcn.includes('confirm') || fcn.includes('btn-red') || fcn.includes('login')) {
+                                        fb.scrollIntoView({ block: 'center', behavior: 'instant' });
+                                        var fr2 = fb.getBoundingClientRect();
+                                        return { x: fr2.left + fr2.width / 2, y: fr2.top + fr2.height / 2, text: 'primary-btn' };
+                                      }
+                                    }
+                                  }
+                                  // Último recurso: qualquer botão grande visível no container
+                                  for (var gi = 0; gi < allBtns.length; gi++) {
+                                    var gb = allBtns[gi];
+                                    var gr = gb.getBoundingClientRect();
+                                    if (gr.width > 80 && gr.height > 30 && !gb.disabled) {
+                                      gb.scrollIntoView({ block: 'center', behavior: 'instant' });
+                                      var gr2 = gb.getBoundingClientRect();
+                                      return { x: gr2.left + gr2.width / 2, y: gr2.top + gr2.height / 2, text: 'container-btn' };
+                                    }
+                                  }
+                                }
+                                return null;
+                              } catch(e) { return null; }
+                            })()`;
+                            const submitRes: any = await cdpSend(ws, 'Runtime.evaluate', { expression: exprSubmitBtn, returnByValue: true }, targetSessionId).catch(() => null);
+                            if (submitRes?.result?.value) {
+                              console.log(`[TIKTOK-VERIFY] Clicando botão de submit "${submitRes.result.value.text}" em (${submitRes.result.value.x}, ${submitRes.result.value.y}) [tentativa ${submitAttempt + 1}]...`);
+                              await realClickAt(submitRes.result.value.x, submitRes.result.value.y, targetSessionId);
+                              await new Promise(r => setTimeout(r, 800));
+                              // Confirmar clique também via element.click() no JS para máxima compatibilidade
+                              await cdpSend(ws, 'Runtime.evaluate', {
+                                expression: `(function() {
+                                  var targetTexts = ['avan\\u00e7ar', 'avancar', 'log in', 'iniciar sess\\u00e3o', 'entrar', 'seguinte', 'next', 'confirmar', 'submit', 'sign in', 'logar'];
+                                  var btns = Array.from(document.querySelectorAll('button, button[type="submit"], div[role="button"]'));
+                                  for (var bi = 0; bi < btns.length; bi++) {
+                                    var b = btns[bi];
+                                    var t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                                    for (var ti = 0; ti < targetTexts.length; ti++) {
+                                      if (t === targetTexts[ti] || t.indexOf(targetTexts[ti]) === 0) {
+                                        try { b.click(); } catch(e) {}
+                                        try { b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch(e) {}
+                                        return true;
+                                      }
+                                    }
+                                  }
+                                  // Fallback: submit o form inteiro
+                                  var pwdInput = document.querySelector('input[type="password"]');
+                                  if (pwdInput) {
+                                    var form = pwdInput.closest('form');
+                                    if (form) { try { form.submit(); } catch(e) {} return true; }
+                                  }
+                                  return false;
+                                })()`
+                              }, targetSessionId).catch(() => {});
+                              submitSuccess = true;
+                            } else {
+                              if (submitAttempt < 2) {
+                                console.log(`[TIKTOK-VERIFY] Botão não encontrado na tentativa ${submitAttempt + 1}, aguardando...`);
+                                await new Promise(r => setTimeout(r, 1500));
                               }
-                              return null;
-                            } catch { return null; }
-                          })()`;
-                          const submitRes: any = await cdpSend(ws, 'Runtime.evaluate', { expression: exprSubmitBtn, returnByValue: true }, targetSessionId).catch(() => null);
-                          if (submitRes?.result?.value) {
-                            console.log('[TIKTOK-VERIFY] Clicando botao de submit em coordenadas do Avancar...');
-                            await realClickAt(submitRes.result.value.x, submitRes.result.value.y, targetSessionId);
-                            await new Promise(r => setTimeout(r, 500));
-                          } else {
-                            console.log('[TIKTOK-VERIFY] Botao nao encontrado, tentando Enter...');
+                            }
+                          }
+
+                          if (!submitSuccess) {
+                            // Fallback final: Enter e form.submit()
+                            console.log('[TIKTOK-VERIFY] Nenhum botão encontrado após 3 tentativas. Usando Enter + form.submit()...');
+                            await cdpSend(ws, 'Runtime.evaluate', {
+                              expression: `(function() {
+                                var pwdInput = document.querySelector('input[type="password"]');
+                                if (pwdInput) {
+                                  var form = pwdInput.closest('form');
+                                  if (form) { try { form.submit(); } catch(e) {} return 'form'; }
+                                  try { pwdInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true })); } catch(e) {}
+                                  return 'keydown';
+                                }
+                                return 'none';
+                              })()`
+                            }, targetSessionId).catch(() => {});
                             await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, key: 'Enter', code: 'Enter' }, targetSessionId).catch(() => {});
                             await cdpSend(ws, 'Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, key: 'Enter', code: 'Enter' }, targetSessionId).catch(() => {});
                           }
