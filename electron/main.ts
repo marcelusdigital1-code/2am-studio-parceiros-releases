@@ -3246,9 +3246,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                     email: email,
                     detail: 'Iniciando fluxo de login TikTok',
                   });
-                  if (runInBackground || isQueueLogin) {
-                    stopLoginScreencastFn = startLoginScreencast(session, profileId, 'tiktok', partnerId);
-                  }
+                  stopLoginScreencastFn = startLoginScreencast(session, profileId, 'tiktok', partnerId);
 
                   const handleTikTokLoginSuccess = async () => {
                     if (ttLoginDetected) return;
@@ -6132,9 +6130,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                       email: email,
                       detail: 'Iniciando fluxo de login Instagram',
                     });
-                    if (runInBackground || isQueueLogin) {
-                      stopIgLoginScreencastFn = startLoginScreencast(session, profileId, 'instagram', partnerId);
-                    }
+                    stopIgLoginScreencastFn = startLoginScreencast(session, profileId, 'instagram', partnerId);
 
                     const handleInstagramLoginSuccess = async () => {
                       if (igLoginDetected) return;
@@ -6581,9 +6577,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                       email: email,
                       detail: 'Iniciando fluxo de auto-login Facebook',
                     });
-                    if (runInBackground || isQueueLogin) {
-                      stopFbLoginScreencastFn = startLoginScreencast(session, profileId, 'facebook', partnerId);
-                    }
+                    stopFbLoginScreencastFn = startLoginScreencast(session, profileId, 'facebook', partnerId);
 
                     const handleFacebookLoginSuccess = async () => {
                       if (fbLoginDetected) return;
@@ -7318,9 +7312,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                       email: googleEmail || email,
                       detail: 'Iniciando fluxo de auto-login YouTube/Google',
                     });
-                    if (runInBackground || isQueueLogin) {
-                      stopYtLoginScreencastFn = startLoginScreencast(session, profileId, 'youtube', partnerId);
-                    }
+                    stopYtLoginScreencastFn = startLoginScreencast(session, profileId, 'youtube', partnerId);
 
                     handleYouTubeLoginSuccess = () => {
                       if (ytLoginDetected) return;

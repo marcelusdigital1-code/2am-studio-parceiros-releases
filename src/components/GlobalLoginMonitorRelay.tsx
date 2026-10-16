@@ -49,6 +49,9 @@ export const GlobalLoginMonitorRelay: React.FC<Props> = ({ partnerId }) => {
     if ((window as any).electronAPI?.onLoginScreencastFrame) {
       (window as any).electronAPI.onLoginScreencastFrame(handleLoginScreencastFrame);
     }
+    if ((window as any).electronAPI?.onRemoteScreencastFrame) {
+      (window as any).electronAPI.onRemoteScreencastFrame(handleLoginScreencastFrame);
+    }
 
     // 3. Escutar comandos de intervenção do ADM
     channel
