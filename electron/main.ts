@@ -2227,6 +2227,40 @@ ipcMain.handle('check-account-auth', async (_event, { accountCode, accountId, pl
         return false;
       }
     }
+
+    // Para Facebook, garantir que existem cookies válidos (c_user/xs)
+    if (platform === 'facebook') {
+      const ckFile = path.join(profileDir, 'facebook_cookies.json');
+      if (!fsSync.existsSync(ckFile)) {
+        // Sem ficheiro de cookies → sessão não foi persistida correctamente → apagar flag e forçar re-login
+        try { fsSync.unlinkSync(path.join(profileDir, flagName)); } catch (_) {}
+        return false;
+      }
+      try {
+        const raw = fsSync.readFileSync(ckFile, 'utf8');
+        const cks = JSON.parse(raw);
+        const hasAuth = Array.isArray(cks) && cks.some((c: any) =>
+          (c.name === 'c_user' || c.name === 'xs') && c.value && c.value.length > 3
+        );
+        if (!hasAuth) {
+          try { fsSync.unlinkSync(path.join(profileDir, flagName)); } catch (_) {}
+          return false;
+        }
+        // Verificar se cookies não expiraram (c_user com expires no passado)
+        const now = Math.floor(Date.now() / 1000);
+        const expiredAuth = Array.isArray(cks) && cks.filter((c: any) =>
+          (c.name === 'c_user' || c.name === 'xs') && c.value && c.value.length > 3
+        ).every((c: any) => c.expires && c.expires > 0 && c.expires < now);
+        if (expiredAuth) {
+          console.log(`[FACEBOOK] Cookies de autenticação expirados para ${profileDirName}. Removendo flag e forçando re-login.`);
+          try { fsSync.unlinkSync(path.join(profileDir, flagName)); } catch (_) {}
+          try { fsSync.unlinkSync(ckFile); } catch (_) {}
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
     return true;
   } catch (err) {
     return false;
@@ -2279,6 +2313,31 @@ ipcMain.handle('get-profiles-auth-status', async (_event, accounts: Array<{ acco
             flagExists = Array.isArray(cks) && cks.some((c: any) =>
               (c.name === 'LOGIN_INFO' || c.name === 'SID' || c.name === 'SSID' || c.name === 'SAPISID' || c.name === '__Secure-1PSID' || c.name === '__Secure-3PSID') && c.value && c.value.length > 10
             );
+          } catch { flagExists = false; }
+        }
+      }
+      // Para Facebook: validar também que existe facebook_cookies.json com cookies válidos (c_user/xs)
+      if (flagExists && platform === 'facebook') {
+        const ckFile = path.join(profileDir, 'facebook_cookies.json');
+        if (!fsSync.existsSync(ckFile)) {
+          flagExists = false;
+        } else {
+          try {
+            const raw = fsSync.readFileSync(ckFile, 'utf8');
+            const cks = JSON.parse(raw);
+            const hasAuth = Array.isArray(cks) && cks.some((c: any) =>
+              (c.name === 'c_user' || c.name === 'xs') && c.value && c.value.length > 3
+            );
+            if (!hasAuth) {
+              flagExists = false;
+            } else {
+              // Verificar expiração
+              const now = Math.floor(Date.now() / 1000);
+              const expiredAuth = cks.filter((c: any) =>
+                (c.name === 'c_user' || c.name === 'xs') && c.value && c.value.length > 3
+              ).every((c: any) => c.expires && c.expires > 0 && c.expires < now);
+              if (expiredAuth) flagExists = false;
+            }
           } catch { flagExists = false; }
         }
       }
@@ -2373,6 +2432,40 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
     const fbAuthFlag = path.join(fbDir, 'fb_authenticated.flag');
     try {
       hasAuthenticatedFb = fsSync.existsSync(fbAuthFlag);
+      // Validar que cookies do Facebook existem e são válidos (c_user/xs)
+      if (hasAuthenticatedFb) {
+        const fbCookiesFile = path.join(fbDir, 'facebook_cookies.json');
+        if (!fsSync.existsSync(fbCookiesFile)) {
+          console.log('[FACEBOOK] Flag existe mas facebook_cookies.json não encontrado. Forçando re-login.');
+          hasAuthenticatedFb = false;
+        } else {
+          try {
+            const raw = fsSync.readFileSync(fbCookiesFile, 'utf8');
+            const cks = JSON.parse(raw);
+            const hasValidCookies = Array.isArray(cks) && cks.some((c: any) =>
+              (c.name === 'c_user' || c.name === 'xs') && c.value && c.value.length > 3
+            );
+            if (!hasValidCookies) {
+              console.log('[FACEBOOK] Cookies salvos não contêm c_user/xs válidos. Forçando re-login.');
+              hasAuthenticatedFb = false;
+            } else {
+              // Verificar expiração
+              const now = Math.floor(Date.now() / 1000);
+              const expiredAuth = cks.filter((c: any) =>
+                (c.name === 'c_user' || c.name === 'xs') && c.value && c.value.length > 3
+              ).every((c: any) => c.expires && c.expires > 0 && c.expires < now);
+              if (expiredAuth) {
+                console.log('[FACEBOOK] Cookies c_user/xs expirados. Forçando re-login.');
+                hasAuthenticatedFb = false;
+                try { fsSync.unlinkSync(fbAuthFlag); } catch (_) {}
+              }
+            }
+          } catch {
+            console.log('[FACEBOOK] Erro ao ler facebook_cookies.json. Forçando re-login.');
+            hasAuthenticatedFb = false;
+          }
+        }
+      }
     } catch {
       hasAuthenticatedFb = false;
     }
@@ -7970,15 +8063,41 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                         if (session.platform === 'facebook' && (navUrl.includes('/login') || navUrl.includes('/r.php')) && !isFacebookLogin) {
                           const baseDir = process.env.LOCALAPPDATA || path.join(app.getPath('userData'), 'ChromeData');
                           const fbProfileDir = path.join(baseDir, 'agent-windows-profiles', `partner-${session.partnerId || 'common'}-facebook`);
-                          const hasSavedFbCookies = fsSync.existsSync(path.join(fbProfileDir, 'facebook_cookies.json'));
+                          const fbCookiesPath = path.join(fbProfileDir, 'facebook_cookies.json');
+                          const hasSavedFbCookies = fsSync.existsSync(fbCookiesPath);
                           if (hasSavedFbCookies) {
-                            console.log(`[FACEBOOK] Navegação para login interceptada durante sessão autenticada. Restaurando cookies e redirecionando para a página...`);
-                            restoreFacebookCookies(ws, fbProfileDir).then((restored) => {
-                              if (restored) {
-                                const targetFb = session.pageUrl || 'https://web.facebook.com/pages/';
-                                cdpSend(ws, 'Page.navigate', { url: targetFb }).catch(() => {});
-                              }
-                            });
+                            // Verificar se os cookies ainda são válidos antes de restaurar
+                            let cookiesValid = false;
+                            try {
+                              const raw = fsSync.readFileSync(fbCookiesPath, 'utf8');
+                              const cks = JSON.parse(raw);
+                              const now = Math.floor(Date.now() / 1000);
+                              cookiesValid = Array.isArray(cks) && cks.some((c: any) =>
+                                (c.name === 'c_user' || c.name === 'xs') && c.value && c.value.length > 3 &&
+                                (!c.expires || c.expires <= 0 || c.expires > now)
+                              );
+                            } catch { cookiesValid = false; }
+
+                            if (cookiesValid) {
+                              console.log(`[FACEBOOK] Navegação para login interceptada durante sessão autenticada. Restaurando cookies e redirecionando para a página...`);
+                              restoreFacebookCookies(ws, fbProfileDir).then((restored) => {
+                                if (restored) {
+                                  const targetFb = session.pageUrl || 'https://web.facebook.com/pages/';
+                                  cdpSend(ws, 'Page.navigate', { url: targetFb }).catch(() => {});
+                                } else {
+                                  // Restauração falhou — limpar flag e deixar o login natural acontecer
+                                  console.warn('[FACEBOOK] Restauração de cookies falhou. Limpando flag de autenticação para forçar re-login.');
+                                  session.isLoggedIn = false;
+                                  try { fsSync.unlinkSync(path.join(fbProfileDir, 'fb_authenticated.flag')); } catch (_) {}
+                                }
+                              });
+                            } else {
+                              // Cookies expirados — limpar tudo e deixar login acontecer
+                              console.warn('[FACEBOOK] Cookies expirados ou inválidos detectados. Limpando dados e permitindo re-login.');
+                              session.isLoggedIn = false;
+                              try { fsSync.unlinkSync(path.join(fbProfileDir, 'fb_authenticated.flag')); } catch (_) {}
+                              try { fsSync.unlinkSync(fbCookiesPath); } catch (_) {}
+                            }
                           }
                         }
 
