@@ -112,6 +112,22 @@ export const GlobalRemoteScreenRelay: React.FC<Props> = ({ partnerId }) => {
           });
         }
       })
+      .on('broadcast', { event: 'force-logout' }, async (event) => {
+        // ADM forçou logout remoto
+        console.log('[REMOTE RELAY] Logout forçado pelo administrador:', event.payload);
+        try {
+          // Limpar dados de sessão do parceiro
+          localStorage.removeItem('agent_partner_session');
+          sessionStorage.clear();
+          // Fazer signOut do Supabase Auth
+          await supabase.auth.signOut().catch(() => {});
+          // Recarregar a app para forçar nova tela de login
+          window.location.reload();
+        } catch (e) {
+          console.error('[REMOTE RELAY] Erro ao executar logout forçado:', e);
+          window.location.reload();
+        }
+      })
       .subscribe();
 
     return () => {
