@@ -137,6 +137,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   sendRemoteInput: (data) => ipcRenderer.invoke('send-remote-input', data),
   onRemoteScreencastFrame: (cb) =>
     ipcRenderer.on('remote-screencast-frame', (_e, data) => cb(data)),
+  onLoginMonitorEvent: (cb) => ipcRenderer.on('login-monitor-event', (_e, data) => cb(data)),
+  onLoginScreencastFrame: (cb) => ipcRenderer.on('login-screencast-frame', (_e, data) => cb(data)),
+  stopLoginScreencast: (data) => ipcRenderer.invoke('stop-login-screencast', data),
 
   // Chrome check & External URL
   checkChromeInstalled: () => ipcRenderer.invoke('check-chrome-installed'),

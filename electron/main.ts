@@ -274,6 +274,158 @@ interface ActiveScreencast {
 }
 const activeScreencasts = new Map<string, ActiveScreencast>();
 
+// ── Monitoramento Remoto de Login (ADM pode ver e intervir durante auto-login) ──
+interface ActiveLoginScreencast {
+  accountCode: string;
+  platform: string;
+  session: ChromeSession;
+  listener: (raw: WebSocket.Data) => void;
+  stuckTimer: NodeJS.Timeout | null;
+  lastProgressTime: number;
+}
+const activeLoginScreencasts = new Map<string, ActiveLoginScreencast>();
+
+/**
+ * Envia evento de monitoramento de login para o renderer (que retransmite ao ADM via Supabase Realtime).
+ * Tipos: login_started, login_progress, login_success, login_error, login_stuck
+ */
+function broadcastLoginEvent(
+  partnerId: string,
+  eventData: {
+    type: 'login_started' | 'login_progress' | 'login_success' | 'login_error' | 'login_stuck';
+    platform: string;
+    accountCode: string;
+    email?: string;
+    detail?: string;
+  }
+) {
+  try {
+    const payload = { partnerId, timestamp: Date.now(), ...eventData };
+    console.log(`[LOGIN-MONITOR] ${eventData.type.toUpperCase()}: ${eventData.platform}/@${eventData.accountCode} — ${eventData.detail || ''}`);
+    mainWindow?.webContents.send('login-monitor-event', payload);
+  } catch (e) {
+    console.warn('[LOGIN-MONITOR] Erro ao enviar evento:', e);
+  }
+}
+
+/**
+ * Inicia screencast automático durante auto-login para que o ADM possa monitorar e intervir.
+ * Frames são enviados via IPC para o renderer, que retransmite via Supabase Realtime.
+ * Retorna função cleanup para parar o screencast.
+ */
+function startLoginScreencast(
+  session: ChromeSession,
+  accountCode: string,
+  platform: string,
+  partnerId: string
+): (() => void) | null {
+  try {
+    const ws = session.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return null;
+
+    // Limpar screencast anterior se existir
+    if (activeLoginScreencasts.has(accountCode)) {
+      const prev = activeLoginScreencasts.get(accountCode)!;
+      try {
+        prev.session.ws?.removeListener('message', prev.listener);
+        cdpSend(prev.session.ws!, 'Page.stopScreencast').catch(() => {});
+        if (prev.stuckTimer) clearInterval(prev.stuckTimer);
+      } catch {}
+      activeLoginScreencasts.delete(accountCode);
+    }
+
+    const listener = (raw: WebSocket.Data) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.method === 'Page.screencastFrame') {
+          const { data, metadata, sessionId } = msg.params;
+
+          // Enviar frame ao renderer para relay via Supabase
+          mainWindow?.webContents.send('login-screencast-frame', {
+            accountCode,
+            platform,
+            partnerId,
+            frame: data,
+            metadata,
+          });
+
+          // Atualizar timestamp de progresso
+          const active = activeLoginScreencasts.get(accountCode);
+          if (active) active.lastProgressTime = Date.now();
+
+          // ACK com throttle de 300ms
+          setTimeout(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              try {
+                ws.send(JSON.stringify({
+                  id: ++globalCdpId,
+                  method: 'Page.screencastFrameAck',
+                  params: { sessionId }
+                }));
+              } catch {}
+            }
+          }, 300);
+        }
+      } catch {}
+    };
+
+    ws.on('message', listener);
+
+    // Timer de detecção de login travado (60s sem progresso na página)
+    const stuckTimer = setInterval(() => {
+      const active = activeLoginScreencasts.get(accountCode);
+      if (!active) return;
+      const elapsed = Date.now() - active.lastProgressTime;
+      if (elapsed > 60000) {
+        broadcastLoginEvent(partnerId, {
+          type: 'login_stuck',
+          platform,
+          accountCode,
+          detail: `Login sem progresso há ${Math.round(elapsed / 1000)}s — intervenção ADM recomendada`,
+        });
+      }
+    }, 30000);
+
+    activeLoginScreencasts.set(accountCode, {
+      accountCode,
+      platform,
+      session,
+      listener,
+      stuckTimer,
+      lastProgressTime: Date.now(),
+    });
+
+    // Iniciar screencast CDP (qualidade menor para login — economia de banda)
+    cdpSend(ws, 'Page.startScreencast', {
+      format: 'jpeg',
+      quality: 40,
+      maxWidth: 900,
+      maxHeight: 560,
+      everyNthFrame: 2
+    }).then(() => {
+      console.log(`[LOGIN-MONITOR] Screencast iniciado para @${accountCode} (${platform})`);
+    }).catch((err) => {
+      console.warn(`[LOGIN-MONITOR] Falha ao iniciar screencast para @${accountCode}:`, err);
+    });
+
+    // Retornar função de cleanup
+    return () => {
+      try {
+        ws.removeListener('message', listener);
+        if (ws.readyState === WebSocket.OPEN) {
+          cdpSend(ws, 'Page.stopScreencast').catch(() => {});
+        }
+        if (stuckTimer) clearInterval(stuckTimer);
+        activeLoginScreencasts.delete(accountCode);
+        console.log(`[LOGIN-MONITOR] Screencast encerrado para @${accountCode}`);
+      } catch {}
+    };
+  } catch (err) {
+    console.warn('[LOGIN-MONITOR] Erro ao iniciar screencast de login:', err);
+    return null;
+  }
+}
+
 function ensureSecurityExtension(): string {
   const extDir = path.join(app.getPath('userData'), 'security-extension');
   try {
@@ -2059,6 +2211,27 @@ ipcMain.handle('stop-remote-stream', async (event, { accountCode }: { accountCod
   }
 });
 
+// ── IPC: Encerrar Screencast de Monitoramento de Login ──
+ipcMain.handle('stop-login-screencast', async (_event, { accountCode }: { accountCode: string }) => {
+  try {
+    const active = activeLoginScreencasts.get(accountCode);
+    if (active) {
+      if (active.session.ws && active.session.ws.readyState === WebSocket.OPEN) {
+        try {
+          active.session.ws.removeListener('message', active.listener);
+          await cdpSend(active.session.ws, 'Page.stopScreencast');
+        } catch {}
+      }
+      if (active.stuckTimer) clearInterval(active.stuckTimer);
+      activeLoginScreencasts.delete(accountCode);
+      console.log(`[LOGIN-MONITOR] Screencast de login encerrado para @${accountCode} (via IPC)`);
+    }
+    return { success: true };
+  } catch (err: unknown) {
+    return { success: false, error: err instanceof Error ? err.message : 'Erro ao parar screencast de login' };
+  }
+});
+
 // ── IPC: Executar Comandos de Input Remoto no Chrome via CDP (Clique, Digitação, Teclas) ──
 ipcMain.handle('send-remote-input', async (_event, {
   accountCode,
@@ -3064,6 +3237,19 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                   let ttCheckInterval: NodeJS.Timeout | null = null;
                   let ttCloseTimeout: NodeJS.Timeout | null = null;
 
+                  // ── Monitoramento Remoto de Login (ADM) ──
+                  let stopLoginScreencastFn: (() => void) | null = null;
+                  if (runInBackground || isQueueLogin) {
+                    broadcastLoginEvent(partnerId, {
+                      type: 'login_started',
+                      platform: 'tiktok',
+                      accountCode: profileId,
+                      email: email,
+                      detail: 'Iniciando fluxo de auto-login TikTok',
+                    });
+                    stopLoginScreencastFn = startLoginScreencast(session, profileId, 'tiktok', partnerId);
+                  }
+
                   const handleTikTokLoginSuccess = async () => {
                     if (ttLoginDetected) return;
                     ttLoginDetected = true;
@@ -3074,6 +3260,16 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                     session.isLoggedIn = true;
                     console.log(`[TIKTOK] Login confirmado com sucesso para o perfil ${profileId}! Salvando cookies e gravando tt_authenticated.flag...`);
+
+                    // Notificar ADM do sucesso e encerrar screencast de monitoramento
+                    broadcastLoginEvent(partnerId, {
+                      type: 'login_success',
+                      platform: 'tiktok',
+                      accountCode: profileId,
+                      email: email,
+                      detail: 'Login TikTok confirmado com sucesso',
+                    });
+                    if (stopLoginScreencastFn) { stopLoginScreencastFn(); stopLoginScreencastFn = null; }
 
                     const ttProfileDir = session.profileDir || profileDir;
 
@@ -3519,6 +3715,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             await new Promise(r => setTimeout(r, 100));
 
                             console.log(`[GOOGLE-LOGIN] Digitando e-mail naturalmente: ${email.split('@')[0]}...`);
+                      if (runInBackground || isQueueLogin) broadcastLoginEvent(partnerId, { type: 'login_progress', platform: platform || 'youtube', accountCode: profileId, email, detail: 'Digitando e-mail Google' });
                             await typeGoogleKeys(targetWs, email);
                             await new Promise(r => setTimeout(r, 250));
 
@@ -3680,6 +3877,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                             await new Promise(r => setTimeout(r, 100));
 
                             console.log(`[GOOGLE-LOGIN] Digitando senha naturalmente (${pass.length} caracteres)...`);
+                      if (runInBackground || isQueueLogin) broadcastLoginEvent(partnerId, { type: 'login_progress', platform: platform || 'youtube', accountCode: profileId, email, detail: 'Digitando senha Google' });
                             await typeGoogleKeys(targetWs, pass);
                             await new Promise(r => setTimeout(r, 250));
 
@@ -4305,6 +4503,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                           setBadge('Digitando palavra-passe da conta TikTok...', '#38bdf8');
                           console.log(`[TIKTOK-VERIFY] Focando campo de senha do TikTok e inserindo credencial (${tiktokPass.length} caracteres)...`);
+                    if (runInBackground || isQueueLogin) broadcastLoginEvent(partnerId, { type: 'login_progress', platform: 'tiktok', accountCode: profileId, email, detail: 'Digitando senha TikTok' });
 
                           // 1. Focar o campo de senha via CDP + click real
                           await cdpSend(ws, 'Runtime.evaluate', {
@@ -5924,6 +6123,19 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                     let igCheckInterval: NodeJS.Timeout | null = null;
                     let igCloseTimeout: NodeJS.Timeout | null = null;
 
+                    // ── Monitoramento Remoto de Login (ADM) ──
+                    let stopIgLoginScreencastFn: (() => void) | null = null;
+                    if (runInBackground || isQueueLogin) {
+                      broadcastLoginEvent(partnerId, {
+                        type: 'login_started',
+                        platform: 'instagram',
+                        accountCode: profileId,
+                        email: email,
+                        detail: 'Iniciando fluxo de auto-login Instagram',
+                      });
+                      stopIgLoginScreencastFn = startLoginScreencast(session, profileId, 'instagram', partnerId);
+                    }
+
                     const handleInstagramLoginSuccess = async () => {
                       if (igLoginDetected) return;
                       igLoginDetected = true;
@@ -5934,6 +6146,16 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                       session.isLoggedIn = true;
                       console.log(`[INSTAGRAM] Login confirmado com sucesso para o perfil ${profileId}! Gravando ig_authenticated.flag...`);
+
+                      // Notificar ADM do sucesso e encerrar screencast de monitoramento
+                      broadcastLoginEvent(partnerId, {
+                        type: 'login_success',
+                        platform: 'instagram',
+                        accountCode: profileId,
+                        email: email,
+                        detail: 'Login Instagram confirmado com sucesso',
+                      });
+                      if (stopIgLoginScreencastFn) { stopIgLoginScreencastFn(); stopIgLoginScreencastFn = null; }
 
                       try {
                         const igProfileDir = profileDir;
@@ -5998,6 +6220,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                     const runInstagramLoginAutomation = async () => {
                       console.log(`[INSTAGRAM-LOGIN] Iniciando automação suave e humana para o perfil ${profileId}...`);
+                    if (runInBackground || isQueueLogin) broadcastLoginEvent(partnerId, { type: 'login_progress', platform: 'instagram', accountCode: profileId, email, detail: 'Iniciando automação de login Instagram' });
                       setBadge('Aguardando carregamento do Instagram...', '#38bdf8');
 
                       // ── Garantir foco emulado e janela oculta para execução 100% em segundo plano ──
@@ -6349,6 +6572,19 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                     let fbCloseTimeout: NodeJS.Timeout | null = null;
                     let lastFb2FARequestTime = 0;
 
+                    // ── Monitoramento Remoto de Login (ADM) ──
+                    let stopFbLoginScreencastFn: (() => void) | null = null;
+                    if (runInBackground || isQueueLogin) {
+                      broadcastLoginEvent(partnerId, {
+                        type: 'login_started',
+                        platform: 'facebook',
+                        accountCode: profileId,
+                        email: email,
+                        detail: 'Iniciando fluxo de auto-login Facebook',
+                      });
+                      stopFbLoginScreencastFn = startLoginScreencast(session, profileId, 'facebook', partnerId);
+                    }
+
                     const handleFacebookLoginSuccess = async () => {
                       if (fbLoginDetected) return;
                       fbLoginDetected = true;
@@ -6359,6 +6595,16 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                       session.isLoggedIn = true;
                       console.log(`[FACEBOOK] Login confirmado com sucesso para o parceiro ${partnerId || 'common'}! Gravando fb_authenticated.flag...`);
+
+                      // Notificar ADM do sucesso e encerrar screencast de monitoramento
+                      broadcastLoginEvent(partnerId, {
+                        type: 'login_success',
+                        platform: 'facebook',
+                        accountCode: profileId,
+                        email: email,
+                        detail: 'Login Facebook confirmado com sucesso',
+                      });
+                      if (stopFbLoginScreencastFn) { stopFbLoginScreencastFn(); stopFbLoginScreencastFn = null; }
 
                       try {
                         const fbProfileDir = profileDir;
@@ -6405,6 +6651,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                     const runFacebookLoginAutomation = async () => {
                       console.log(`[FACEBOOK-LOGIN] Iniciando automação unificada e inteligente para o parceiro ${partnerId || 'common'}...`);
+                    if (runInBackground || isQueueLogin) broadcastLoginEvent(partnerId, { type: 'login_progress', platform: 'facebook', accountCode: profileId, email, detail: 'Iniciando automação de login Facebook' });
                       setBadge('Aguardando carregamento do Facebook...', '#38bdf8');
 
                       // ── Garantir foco emulado e janela oculta para execução 100% em segundo plano ──
@@ -7062,12 +7309,35 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
                     let ytLoginDetected = false;
                     let ytCloseTimeout: NodeJS.Timeout | null = null;
 
+                    // ── Monitoramento Remoto de Login (ADM) ──
+                    let stopYtLoginScreencastFn: (() => void) | null = null;
+                    if (runInBackground || isQueueLogin) {
+                      broadcastLoginEvent(partnerId, {
+                        type: 'login_started',
+                        platform: 'youtube',
+                        accountCode: profileId,
+                        email: googleEmail || email,
+                        detail: 'Iniciando fluxo de auto-login YouTube/Google',
+                      });
+                      stopYtLoginScreencastFn = startLoginScreencast(session, profileId, 'youtube', partnerId);
+                    }
+
                     handleYouTubeLoginSuccess = () => {
                       if (ytLoginDetected) return;
                       ytLoginDetected = true;
 
                       session.isLoggedIn = true;
                       console.log(`[YOUTUBE] Login confirmado com sucesso para ${partnerId || profileId}!`);
+
+                      // Notificar ADM do sucesso e encerrar screencast de monitoramento
+                      broadcastLoginEvent(partnerId, {
+                        type: 'login_success',
+                        platform: 'youtube',
+                        accountCode: profileId,
+                        email: googleEmail || email,
+                        detail: 'Login YouTube/Google confirmado com sucesso',
+                      });
+                      if (stopYtLoginScreencastFn) { stopYtLoginScreencastFn(); stopYtLoginScreencastFn = null; }
 
                       try {
                         const ytProfileDir = session.profileDir || profileDir;
@@ -7126,6 +7396,7 @@ ipcMain.on('open-chrome-signup', async (event, payload: string | {
 
                     const runYouTubeLoginAutomation = async () => {
                       console.log(`[YOUTUBE-LOGIN] Iniciando automação Google/YouTube para ${partnerId || profileId}...`);
+                      if (runInBackground || isQueueLogin) broadcastLoginEvent(partnerId, { type: 'login_progress', platform: 'youtube', accountCode: profileId, email: googleEmail || email, detail: 'Iniciando automação Google/YouTube' });
                       setBadge('Aguardando carregamento do Google...', '#38bdf8');
 
                       // ── Garantir foco emulado para que CDP Input funcione 100% em segundo plano ──

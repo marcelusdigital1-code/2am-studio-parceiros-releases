@@ -1,7 +1,7 @@
 {
   "name": "2am-studio-parceiros",
   "productName": "2AM Studio Parceiros",
-  "version": "1.4.53",
+  "version": "1.4.54",
   "author": "2AM Studio",
   "description": "Plataforma e Agente do Parceiro 2AM Studio",
   "private": true,
@@ -53,7 +53,10 @@
       "target": [
         {
           "target": "zip",
-          "arch": ["x64", "arm64"]
+          "arch": [
+            "x64",
+            "arm64"
+          ]
         }
       ],
       "icon": "build/icon.png",

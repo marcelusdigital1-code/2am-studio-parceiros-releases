@@ -10,6 +10,7 @@ import { MetricsView } from './components/MetricsView';
 import { Global2FABanner } from './components/Global2FABanner';
 import { GlobalRemotePublisher } from './components/GlobalRemotePublisher';
 import { GlobalRemoteScreenRelay } from './components/GlobalRemoteScreenRelay';
+import { GlobalLoginMonitorRelay } from './components/GlobalLoginMonitorRelay';
 import { InternetBlockerOverlay } from './components/InternetBlockerOverlay';
 import { ChromeBlockerOverlay } from './components/ChromeBlockerOverlay';
 
@@ -156,6 +157,9 @@ export function App() {
 
           {/* Serviço Global de Acesso Remoto Seguro (Screencast CDP e Input Relay) */}
           <GlobalRemoteScreenRelay partnerId={partner.id} />
+
+          {/* Serviço Global de Monitoramento de Login (Screencast + Eventos + Intervenção ADM) */}
+          <GlobalLoginMonitorRelay partnerId={partner.id} />
 
           <Navigation
             activeTab={activeTab}
